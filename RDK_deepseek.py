@@ -128,6 +128,33 @@ def format_answer(reply: str, per_shop: int = 5, max_reasonable: int = 30) -> st
     return f"{{color:yellow,num:{x}}},{{color:blue,num:{y}}}"
 
 
+def push_answer_to_panel(answer: str):
+    """把解题结果写进 coStudio 布局 JSON（改面板标签，副作用，失败不影响答题）。
+
+    面板脚本/布局 JSON 的目录用环境变量 COSTUDIO_LAYOUT_DIR 指定，
+    默认 Windows 上的 D:\\比赛\\任务挑战赛；目录/脚本/模板任一缺失就静默跳过
+    （比如在 RDK 上跑、没放布局文件时）。
+    """
+    panel_dir = os.environ.get("COSTUDIO_LAYOUT_DIR", r"D:\比赛\任务挑战赛")
+    try:
+        if not os.path.isdir(panel_dir):
+            return None
+        sys.path.insert(0, panel_dir)
+        import gen_layout
+        template = os.path.join(panel_dir, "2026", "可视化软件", "可视化布局参考.json")
+        output = os.path.join(panel_dir, "2026", "可视化软件", "可视化布局.json")
+        labels = gen_layout.update_layout(answer, template, output)
+        if labels:
+            print(f"[面板] 黄色数量={labels['黄色数量']} 蓝色数量={labels['蓝色数量']}"
+                  f" 先抓={labels['先抓取']} 后抓={labels['后抓取']}")
+            print(f"[面板] 已写入 → {output}（在 coStudio 里导入这个文件）")
+        return labels
+    except Exception as e:
+        # 面板更新失败不影响答题流程
+        print(f"[面板] 更新失败（忽略）：{e}")
+        return None
+
+
 def interactive(client, model, system):
     print("DeepSeek 交互模式（输入 exit / quit 退出）")
     while True:
@@ -151,6 +178,7 @@ def interactive(client, model, system):
             reply = ask(client, messages, model, stream=True)
             final = format_answer(reply)
             print(final)
+            push_answer_to_panel(final)
         except Exception as e:
             print(f"\n[错误] {e}")
             continue
@@ -176,7 +204,9 @@ def main():
         ]
         try:
             reply = ask(client, messages, args.model, stream=not args.no_stream)
-            print(format_answer(reply))
+            final = format_answer(reply)
+            print(final)
+            push_answer_to_panel(final)
         except Exception as e:
             print(f"[错误] {e}")
             sys.exit(1)
