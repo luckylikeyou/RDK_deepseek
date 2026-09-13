@@ -197,10 +197,8 @@
       "fallbackLabel": "—",
       "rules": [
         {"operator": "=", "rawValue": "前往资源点", "color": "#c0ecca", "label": "前往资源点"},
-        {"operator": "=", "rawValue": "抓取黄色", "color": "#eaec63", "label": "抓取黄色"},
-        {"operator": "=", "rawValue": "抓取蓝色", "color": "#2b5def", "label": "抓取蓝色"},
-        {"operator": "=", "rawValue": "放置", "color": "#c0ecca", "label": "放置"},
-        {"operator": "=", "rawValue": "完成", "color": "#c0ecca", "label": "完成"}
+        {"operator": "=", "rawValue": "抓取资源", "color": "#eaec63", "label": "抓取资源"},
+        {"operator": "=", "rawValue": "前往放置区", "color": "#8bc1e0", "label": "前往放置区"}
       ],
       "foxglovePanelTitle": "当前任务"
     },
@@ -211,9 +209,7 @@
       "fallbackLabel": "—",
       "rules": [
         {"operator": "=", "rawValue": "待命", "color": "#c0ecca", "label": "待命"},
-        {"operator": "=", "rawValue": "抓取黄色", "color": "#eaec63", "label": "抓取黄色"},
-        {"operator": "=", "rawValue": "抓取蓝色", "color": "#2b5def", "label": "抓取蓝色"},
-        {"operator": "=", "rawValue": "完成", "color": "#c0ecca", "label": "完成"}
+        {"operator": "=", "rawValue": "执行", "color": "#eaec63", "label": "执行"}
       ],
       "foxglovePanelTitle": "状态"
     },
