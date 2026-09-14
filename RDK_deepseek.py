@@ -129,29 +129,22 @@ def format_answer(reply: str, per_shop: int = 5, max_reasonable: int = 30) -> st
 
 
 def push_answer_to_panel(answer: str):
-    """把解题结果写进 coStudio 布局 JSON（改面板标签，副作用，失败不影响答题）。
+    """把解题结果写入 ai_to_panel.py 监听的文件，由它发布到 ROS /task/* 面板。
 
-    面板脚本/布局 JSON 的目录用环境变量 COSTUDIO_LAYOUT_DIR 指定，
-    默认 Windows 上的 D:\\比赛\\任务挑战赛；目录/脚本/模板任一缺失就静默跳过
-    （比如在 RDK 上跑、没放布局文件时）。
+    ai_to_panel.py 用 `--watch <文件>` 盯这个文件（内容稳定 300ms 后解析发布）。
+    路径用环境变量 AI_ANSWER_FILE 指定，默认 /tmp/ai_answer.txt。
+    写文件失败不影响答题（比如文件系统只读时）。
     """
-    panel_dir = os.environ.get("COSTUDIO_LAYOUT_DIR", r"D:\比赛\任务挑战赛")
+    path = os.environ.get("AI_ANSWER_FILE", "/tmp/ai_answer.txt")
     try:
-        if not os.path.isdir(panel_dir):
-            return None
-        sys.path.insert(0, panel_dir)
-        import gen_layout
-        template = os.path.join(panel_dir, "2026", "可视化软件", "可视化布局参考.json")
-        output = os.path.join(panel_dir, "2026", "可视化软件", "可视化布局.json")
-        labels = gen_layout.update_layout(answer, template, output)
-        if labels:
-            print(f"[面板] 黄色数量={labels['黄色数量']} 蓝色数量={labels['蓝色数量']}"
-                  f" 先抓={labels['先抓取']} 后抓={labels['后抓取']}")
-            print(f"[面板] 已写入 → {output}（在 coStudio 里导入这个文件）")
-        return labels
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(answer + "\n")
+        print(f"[面板] 结果已写入 {path}")
+        print(f"[面板] 由 ai_to_panel.py --watch {path} 发布到 coStudio 面板")
+        return path
     except Exception as e:
         # 面板更新失败不影响答题流程
-        print(f"[面板] 更新失败（忽略）：{e}")
+        print(f"[面板] 写入失败（忽略）：{e}")
         return None
 
 
