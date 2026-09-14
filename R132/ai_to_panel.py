@@ -203,12 +203,20 @@ def _simulate(node, state, pubs=None):
 
 
 def _watch(rclpy, path):
-    """监听文件：内容变化后稳定 300ms（方案 A 防闪）才解析发布。"""
+    """监听文件：内容变化后稳定 300ms（方案 A 防闪）才解析发布；并每 2s 重发最近结果。
+
+    为什么常驻重发：std_msgs 主题是易失的（不缓存历史），coStudio 一旦重连 / 重新导入
+    布局，之前发过的消息就收不到了。每 2s 重发一遍最近结果，保证面板任何时候都能在
+    2s 内自动同步回最新值，不用手动重发。
+    """
     from rclpy.node import Node
     last_mtime = None
     last_content = None
+    last_state = None
+    last_pub = 0.0
     node = Node('ai_to_panel')
-    print(f"监听 {path} ...")
+    pubs = make_publishers(node)   # 提前建好，让 /task/* 主题一开跑就存在
+    print(f"监听 {path} ...（每 2s 重发最近结果，Ctrl+C 停止）")
     try:
         while True:
             if os.path.exists(path):
@@ -218,15 +226,21 @@ def _watch(rclpy, path):
                     time.sleep(0.3)   # 等 300ms，确认内容不再变（防半截写入）
                     with open(path, 'r', encoding='utf-8') as f:
                         content = f.read().strip()
-                    if content and content != last_content:
+                    if content != last_content:
                         last_content = content
                         counts = parse_ai_answer(content)
                         if counts['yellow'] is None and counts['blue'] is None:
                             print(f"⚠️ 未解析到答案：{content[:80]!r}", file=sys.stderr)
-                            continue
-                        state = build_panel_state(counts)
-                        labels = publish_state(node, state)
-                        print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
+                        else:
+                            last_state = build_panel_state(counts)
+                            labels = publish_state(node, last_state, pubs)
+                            print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
+                    else:
+                        print(f"文件内容与上次相同（答案没变），跳过：{content[:40]!r}")
+            # 常驻重发：coStudio 重连/重导后能立刻同步到最新结果
+            if last_state is not None and time.time() - last_pub >= 2.0:
+                publish_state(node, last_state, pubs)
+                last_pub = time.time()
             time.sleep(0.2)
     except KeyboardInterrupt:
         pass
