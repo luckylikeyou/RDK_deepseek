@@ -117,21 +117,33 @@ def render_blocks(blocks):
 
 
 def make_publishers(node):
-    """创建全部面板主题的发布器（只建一次，常驻重发时复用，避免反复 create_publisher）。"""
+    """创建全部面板主题的发布器。
+
+    用 transient_local QoS（KEEP_LAST + depth=1 + TRANSIENT_LOCAL）：DDS 保留
+    最后一次发布的值，任何后订阅/重连的面板一订阅就立刻收到最新值，不用靠定时
+    重发来补。这解决「同一批里黄色先变、蓝色滞后」的订阅时机不一致问题。
+    """
     from std_msgs.msg import Int32, String
+    from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
+    qos = QoSProfile(
+        history=QoSHistoryPolicy.KEEP_LAST,
+        depth=1,
+        reliability=QoSReliabilityPolicy.RELIABLE,
+        durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+    )
     pubs = {
-        'yellow':   node.create_publisher(Int32, '/task/yellow_target', 10),
-        'blue':     node.create_publisher(Int32, '/task/blue_target', 10),
-        'first':    node.create_publisher(String, '/task/grab_first', 10),
-        'second':   node.create_publisher(String, '/task/grab_second', 10),
-        'progress': node.create_publisher(String, '/task/progress', 10),
-        'current':  node.create_publisher(String, '/task/current_task', 10),
-        'status':   node.create_publisher(String, '/task/status', 10),
-        'plan':     node.create_publisher(String, '/task/plan', 10),
+        'yellow':   node.create_publisher(Int32, '/task/yellow_target', qos),
+        'blue':     node.create_publisher(Int32, '/task/blue_target', qos),
+        'first':    node.create_publisher(String, '/task/grab_first', qos),
+        'second':   node.create_publisher(String, '/task/grab_second', qos),
+        'progress': node.create_publisher(String, '/task/progress', qos),
+        'current':  node.create_publisher(String, '/task/current_task', qos),
+        'status':   node.create_publisher(String, '/task/status', qos),
+        'plan':     node.create_publisher(String, '/task/plan', qos),
     }
     try:
         from visualization_msgs.msg import MarkerArray
-        pubs['blocks'] = node.create_publisher(MarkerArray, '/task/blocks', 10)
+        pubs['blocks'] = node.create_publisher(MarkerArray, '/task/blocks', qos)
     except ImportError:
         pubs['blocks'] = None
     return pubs
@@ -203,11 +215,11 @@ def _simulate(node, state, pubs=None):
 
 
 def _watch(rclpy, path):
-    """监听文件：内容变化后稳定 300ms（方案 A 防闪）才解析发布；并每 2s 重发最近结果。
+    """监听文件：内容变化后稳定 50ms 才解析发布；并每 0.5s 重发最近结果兜底。
 
     为什么常驻重发：std_msgs 主题是易失的（不缓存历史），coStudio 一旦重连 / 重新导入
-    布局，之前发过的消息就收不到了。每 2s 重发一遍最近结果，保证面板任何时候都能在
-    2s 内自动同步回最新值，不用手动重发。
+    布局，之前发过的消息就收不到了。发布器已用 transient_local QoS 保留最后值，这里
+    再每 0.5s 重发一遍双保险，保证面板任何时候都能在 0.5s 内同步回最新值。
     """
     from rclpy.node import Node
     last_mtime = None
@@ -216,14 +228,14 @@ def _watch(rclpy, path):
     last_pub = 0.0
     node = Node('ai_to_panel')
     pubs = make_publishers(node)   # 提前建好，让 /task/* 主题一开跑就存在
-    print(f"监听 {path} ...（每 2s 重发最近结果，Ctrl+C 停止）")
+    print(f"监听 {path} ...（每 0.5s 重发最近结果兜底，Ctrl+C 停止）")
     try:
         while True:
             if os.path.exists(path):
                 mtime = os.path.getmtime(path)
                 if mtime != last_mtime:
                     last_mtime = mtime
-                    time.sleep(0.3)   # 等 300ms，确认内容不再变（防半截写入）
+                    time.sleep(0.05)   # 等 50ms（deepseek 单次 write+close，几乎无半截风险）
                     with open(path, 'r', encoding='utf-8') as f:
                         content = f.read().strip()
                     if content != last_content:
@@ -237,11 +249,11 @@ def _watch(rclpy, path):
                             print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
                     else:
                         print(f"文件内容与上次相同（答案没变），跳过：{content[:40]!r}")
-            # 常驻重发：coStudio 重连/重导后能立刻同步到最新结果
-            if last_state is not None and time.time() - last_pub >= 2.0:
+            # 常驻重发兜底：transient_local 之外再每 0.5s 重发一次，双保险
+            if last_state is not None and time.time() - last_pub >= 0.5:
                 publish_state(node, last_state, pubs)
                 last_pub = time.time()
-            time.sleep(0.2)
+            time.sleep(0.05)
     except KeyboardInterrupt:
         pass
 
