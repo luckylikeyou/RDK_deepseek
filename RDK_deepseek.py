@@ -10,6 +10,9 @@ DeepSeek API 客户端 —— 可直接在 RDK X5 (Ubuntu aarch64) 上运行。
     # 交互式聊天（多轮对话，保留上下文）
     python3 deepseek_client.py -i
 
+    # 自动：运行题目生成器出题，自动解题并上板
+    python3 deepseek_client.py --auto
+
     # 指定模型 / 自定义系统提示词
     python3 deepseek_client.py "你好" --model deepseek-chat --system "你是机器人助手"
 
@@ -26,6 +29,8 @@ import sys
 import re
 import json
 import math
+import time
+import subprocess
 import argparse
 
 # 默认模型
@@ -92,6 +97,26 @@ def ask(client, messages, model, stream=True):
         return full
     else:
         return resp.choices[0].message.content
+
+
+def run_generator(gen_cmd="./TMSCQtest_arm.bin"):
+    """运行题目生成器，返回打印出来的题目文本（自动剥掉 '题目:' 前缀）。
+
+    生成器命令可用环境变量 QUESTION_GEN 覆盖。运行失败/无输出返回 None。
+    """
+    cmd = os.environ.get("QUESTION_GEN", gen_cmd)
+    try:
+        out = subprocess.check_output(cmd, shell=True, timeout=15)
+    except Exception as e:
+        print(f"[出题] 运行 {cmd} 失败：{e}", file=sys.stderr)
+        return None
+    q = out.decode('utf-8', errors='replace').strip()
+    if not q:
+        print("[出题] 生成器没有输出", file=sys.stderr)
+        return None
+    # 剥掉 '题目:' / '题目：' 前缀
+    q = re.sub(r'^\s*题目\s*[:：]\s*', '', q)
+    return q
 
 
 def format_answer(reply: str, per_shop: int = 5, max_reasonable: int = 30) -> str:
@@ -177,10 +202,128 @@ def interactive(client, model, system):
             continue
 
 
+def auto_loop(client, model, system):
+    """自动循环：出题 → 解题 → 上板，直到 Ctrl+C 手动退出。
+
+    每轮跑一次题目生成器拿到题目，同一道题直接喂给 DeepSeek，题目与答案
+    一一对应、不会错位。每轮间隔用环境变量 AI_LOOP_INTERVAL 控制（秒，默认 3）。
+    """
+    try:
+        interval = float(os.environ.get("AI_LOOP_INTERVAL", "3"))
+    except ValueError:
+        interval = 3.0
+    print(f"自动出题+解题循环（每轮间隔 {interval}s，Ctrl+C 手动退出）")
+    last_q = None
+    while True:
+        try:
+            q = run_generator()
+            if not q:
+                print("[出题] 失败，2 秒后重试...", file=sys.stderr)
+                time.sleep(2)
+                continue
+            if q == last_q:
+                # 生成器题库小、随机种子没变时会连抽同一道题，跳过重抽
+                print(f"[跳过] 生成器又抽到同一道题，{interval}s 后再抽...")
+                time.sleep(interval)
+                continue
+            last_q = q
+            print("=" * 60)
+            print(f"题目: {q}")
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": q},
+            ]
+            reply = ask(client, messages, model, stream=True)
+            final = format_answer(reply)
+            print(final)
+            push_answer_to_panel(final)
+            print("=" * 60)
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\n手动退出")
+            break
+        except Exception as e:
+            print(f"[错误] {e}")
+            time.sleep(2)
+
+
+def _read_text(path):
+    """读文件文本并 strip；文件不存在或读失败返回 None。"""
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _clear_text(path):
+    """清空文件内容（作为「这道题已消费」的信号），失败忽略。"""
+    try:
+        open(path, 'w', encoding='utf-8').close()
+    except OSError:
+        pass
+
+
+def watch_question(client, model, system, path):
+    """被动接题：题目文件里出现完整新题就解一次，解完清空文件，再等下一道。
+
+    出题侧每次跑生成器把题写进 path：
+        ./TMSCQtest_arm.bin > /tmp/question.txt
+    本进程读到非空且稳定（连读两次内容一致）的题目就解一次、上板，然后把文件
+    清空作为「已消费」信号。这样「跑一次生成器 = 解一次」，不多解、不漏解。
+
+    前提：先启动本进程、再跑生成器；并等上一次「已解题」打印出来再跑下一次，
+    避免生成器把上一道还没解的题覆盖掉。
+    """
+    print(f"监听题目文件 {path} ...（先启动本进程，再跑 ./TMSCQtest_arm.bin > {path}；Ctrl+C 退出）")
+    while True:
+        try:
+            if not os.path.exists(path):
+                time.sleep(0.3)
+                continue
+            # 稳定读：连读两次内容一致，才认为题目写完整了（防读到半截）
+            r1 = _read_text(path)
+            time.sleep(0.3)
+            r2 = _read_text(path)
+            if r1 is None or r2 is None or r1 != r2:
+                time.sleep(0.3)
+                continue
+            q = re.sub(r'^\s*题目\s*[:：]\s*', '', r1).strip()
+            if not q:
+                time.sleep(0.3)
+                continue
+            print("=" * 60)
+            print(f"题目: {q}")
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": q},
+            ]
+            try:
+                reply = ask(client, messages, model, stream=True)
+                final = format_answer(reply)
+                print(final)
+                push_answer_to_panel(final)
+            except Exception as e:
+                print(f"[错误] {e}")
+            finally:
+                _clear_text(path)   # 无论成败都清空，避免同一道题被反复解
+            print("=" * 60)
+            print("已解题，继续等待下一道题...")
+        except KeyboardInterrupt:
+            print("\n手动退出")
+            break
+        except Exception as e:
+            print(f"[错误] {e}")
+            time.sleep(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="DeepSeek API 客户端")
     parser.add_argument("question", nargs="?", help="单次提问内容")
     parser.add_argument("-i", "--interactive", action="store_true", help="进入交互模式")
+    parser.add_argument("--auto", action="store_true", help="自动：运行题目生成器出题，自动解题并上板")
+    parser.add_argument("--watch-question", metavar="FILE",
+                        help="监听题目文件：出现新题就解一次，解完继续等下一道")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"模型 ID（默认 {DEFAULT_MODEL}）")
     parser.add_argument("--system", default=DEFAULT_SYSTEM, help="系统提示词")
     parser.add_argument("--no-stream", action="store_true", help="关闭流式输出")
@@ -190,6 +333,10 @@ def main():
 
     if args.interactive:
         interactive(client, args.model, args.system)
+    elif args.auto:
+        auto_loop(client, args.model, args.system)
+    elif args.watch_question:
+        watch_question(client, args.model, args.system, args.watch_question)
     elif args.question:
         messages = [
             {"role": "system", "content": args.system},
