@@ -10,7 +10,7 @@ DeepSeek API 客户端 —— 可直接在 RDK X5 (Ubuntu aarch64) 上运行。
     # 交互式聊天（多轮对话，保留上下文）
     python3 deepseek_client.py -i
 
-    # 自动：运行题目生成器出题，自动解题并上板
+    # 自动：运行题目生成器出题，自动解题 -> 上板 -> 派单给机械臂抓取
     python3 deepseek_client.py --auto
 
     # 指定模型 / 自定义系统提示词
@@ -22,6 +22,7 @@ DeepSeek API 客户端 —— 可直接在 RDK X5 (Ubuntu aarch64) 上运行。
 
 依赖:
     pip3 install openai
+    机械臂派单需 source ROS 工作区（custom_msgs），并已启动 connecter 节点（提供 /send_command）。
 """
 
 import os
@@ -173,6 +174,93 @@ def push_answer_to_panel(answer: str):
         return None
 
 
+def answer_to_targets(answer: str):
+    """把 "{color:yellow,num:X},{color:blue,num:Y}" 转成 send_command 的 payload。
+
+    返回 {"targets":[{"color":"yellow","num":X},...],"total":X+Y}；解析失败返回 None。
+    """
+    pairs = re.findall(
+        r'color\s*:\s*(yellow|blue)\s*,\s*num\s*:\s*(\d+)', answer, re.IGNORECASE
+    )
+    if not pairs:
+        print(f"[机械臂] 解析不到 color/num 对：{answer!r}", file=sys.stderr)
+        return None
+    targets = [{"color": c.lower(), "num": int(n)} for c, n in pairs]
+    return {"targets": targets, "total": sum(t["num"] for t in targets)}
+
+
+# 机械臂派单用的 ROS 客户端（惰性初始化一次，复用同一个 node/client）
+_arm_node = None
+_arm_cli = None
+
+
+def _get_arm_client():
+    """惰性初始化 rclpy 与 /send_command 客户端；ROS 不可用时返回 (None, None)。"""
+    global _arm_node, _arm_cli
+    if _arm_node is not None:
+        return _arm_node, _arm_cli
+    try:
+        import rclpy
+        from rclpy.node import Node
+        from custom_msgs.srv import StrMsg
+    except Exception as e:
+        print(f"[机械臂] 无法导入 rclpy/custom_msgs（source 工作区了吗？）：{e}",
+              file=sys.stderr)
+        return None, None
+    if not rclpy.ok():
+        rclpy.init(args=[])
+    _arm_node = Node('deepseek_arm_dispatch')
+    _arm_cli = _arm_node.create_client(StrMsg, 'send_command')
+    return _arm_node, _arm_cli
+
+
+def push_answer_to_arm(answer: str):
+    """把解题结果派给机械臂：调 /send_command 服务，按颜色抓取到放置区。
+
+    connecter 节点（tools_demo）提供 /send_command (custom_msgs/srv/StrMsg)，
+    request.data 是 {"targets":[{"color":"yellow","num":X},...],"total":N} 的 JSON。
+    机械臂未就绪 / ROS 没 source 时只打印警告，不影响答题流程。
+
+    先等面板把结果完整映射完（push_answer_to_panel 写文件后，ai_to_panel 会解析并
+    发布到 /task/*），再让机械臂开工，确保「结果上板 → 机械臂开始」的顺序。
+    等待时长用环境变量 PANEL_TO_ARM_DELAY（秒，默认 1.0）控制。
+    """
+    try:
+        panel_delay = float(os.environ.get("PANEL_TO_ARM_DELAY", "1.0"))
+    except ValueError:
+        panel_delay = 1.0
+    if panel_delay > 0:
+        time.sleep(panel_delay)
+
+    payload = answer_to_targets(answer)
+    if payload is None:
+        return None
+
+    node, cli = _get_arm_client()
+    if node is None or cli is None:
+        return None
+
+    import rclpy
+    try:
+        if not cli.service_is_ready():
+            if not cli.wait_for_service(timeout_sec=3.0):
+                print("[机械臂] /send_command 服务未就绪（connecter 没启动？），跳过派单",
+                      file=sys.stderr)
+                return None
+        req = cli.srv_type.Request()
+        req.data = json.dumps(payload, ensure_ascii=False)
+        future = cli.call_async(req)
+        # 同步等返回：抓取本身是阻塞动作，这里阻塞等是合理的
+        while rclpy.ok() and not future.done():
+            rclpy.spin_once(node, timeout_sec=0.1)
+        res = future.result()
+        print(f"[机械臂] 已派单 {payload} -> success={res.success}, message={res.message}")
+        return res
+    except Exception as e:
+        print(f"[机械臂] 派单失败（忽略）：{e}", file=sys.stderr)
+        return None
+
+
 def interactive(client, model, system):
     print("DeepSeek 交互模式（输入 exit / quit 退出）")
     while True:
@@ -197,6 +285,7 @@ def interactive(client, model, system):
             final = format_answer(reply)
             print(final)
             push_answer_to_panel(final)
+            push_answer_to_arm(final)
         except Exception as e:
             print(f"\n[错误] {e}")
             continue
@@ -237,6 +326,7 @@ def auto_loop(client, model, system):
             final = format_answer(reply)
             print(final)
             push_answer_to_panel(final)
+            push_answer_to_arm(final)
             print("=" * 60)
             time.sleep(interval)
         except KeyboardInterrupt:
@@ -303,6 +393,7 @@ def watch_question(client, model, system, path):
                 final = format_answer(reply)
                 print(final)
                 push_answer_to_panel(final)
+                push_answer_to_arm(final)
             except Exception as e:
                 print(f"[错误] {e}")
             finally:
@@ -347,6 +438,7 @@ def main():
             final = format_answer(reply)
             print(final)
             push_answer_to_panel(final)
+            push_answer_to_arm(final)
         except Exception as e:
             print(f"[错误] {e}")
             sys.exit(1)
