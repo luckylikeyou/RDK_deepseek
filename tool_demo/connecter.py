@@ -7,22 +7,23 @@
  - 遍历方块信息->
     - 工具坐标系转换基坐标系
     - 颜色分组
- - 根据颜色分组，执行抓取->
+ - 按「数量多者先抓」排序，执行抓取->
     - 移动到指定位置
     - 吸取
-    - 移动到放置位置
+    - 移动到放置位置（只有一个放置区）
     - 释放
+ - 真实抓取时把 任务进度/当前任务/状态 实时刷到面板：
+    - 状态 = 前往抓取（吸盘上没物块）/ 前往放置（吸盘上有物块）
 """
+
+import json
 
 import rclpy
 from rclpy.node import Node
 from custom_msgs.srv import StrMsg
 from std_srvs.srv import Trigger
+from std_msgs.msg import String
 
-# from custom_msgs.srv import MoveToPoint
-import json
-
-# import os
 from time import sleep
 from tools_demo.modules.jaka import Jaka
 from tools_demo.modules.tools import tool_to_base
@@ -47,7 +48,7 @@ class Connecter(Node):
             self.get_logger().error("robot is not ready")
             return
 
-        # 放置区
+        # 放置区（只有一个位置）
         self.back_pose = [-31.20, 374.393, 143.20, 180, 0.0, 0.0]
 
         # 末端位置，拾取移动距离 单位mm
@@ -62,6 +63,12 @@ class Connecter(Node):
         self.srv_client = self.create_client(Trigger, "restart_detection")
         self.target_count = 0
         self.blocks_data = []
+        self.targets = []  # 多目标 [{"color":"yellow","num":2}, ...]，按数量降序
+
+        # 面板动态字段发布（真实抓取时实时刷新 任务进度/当前任务/状态）
+        self.pub_progress = self.create_publisher(String, "/task/progress", 10)
+        self.pub_current = self.create_publisher(String, "/task/current_task", 10)
+        self.pub_status = self.create_publisher(String, "/task/status", 10)
 
     def robot_is_ready(self):
         ret = False
@@ -102,112 +109,88 @@ class Connecter(Node):
             return future.result()
 
     def connect_callback_(self, request: StrMsg.Request, response: StrMsg.Response):
-        """PS
-        ros2 service call /send_command custom_msgs/srv/StrMsg "{data: '{\"color\": \"yellow\",\"num\": 3}'}"
+        """接收多目标抓取请求：
+        request.data = {"targets":[{"color":"yellow","num":2},{"color":"blue","num":3}],"total":5}
+        哪个颜色数量多就先抓哪个。
         """
         self.get_logger().info(f"request received: {request.data}")
         try:
-            # 1. 提取第一个命令块（去除方括号和空格）
-            first_block = request.data.strip().strip('[]').split('],')[0].strip()
-            
-            # 2. 分割键值对（更健壮的分割方式）
-            key_value_pairs = []
-            for pair in first_block.split(','):
-                pair = pair.strip()
-                # 使用正则表达式分割键值对
-                if ':' in pair:
-                    key, value = pair.split(':', 1)
-                    key_value_pairs.append((key.strip(), value.strip()))
-            
-            # 3. 验证键值对数量
-            if len(key_value_pairs) < 2:
-                raise ValueError(f"Expected 2 key-value pairs, got {len(key_value_pairs)}")
-            
-            # 4. 创建命令字典（忽略键名，只关注值）
-            self.command = {}
-            # 第一个值总是颜色
-            self.target_color = key_value_pairs[0][1]  # 取第一个键值对的值
-            
-            # 5. 在剩余键值对中查找数字
-            num_found = None
-            for key, value in key_value_pairs[1:]:
-                try:
-                    num_found = int(value)
-                    break  # 找到有效数字就停止
-                except ValueError:
-                    continue
-            
-            if num_found is None:
-                # 如果没有找到有效数字，尝试解析最后一个值
-                try:
-                    num_found = int(key_value_pairs[-1][1])
-                except ValueError:
-                    raise ValueError("No valid number found in the command")
-            
-            self.target_num = num_found
-            self.other_num = 5 - self.target_num
-            
-            self.get_logger().info(f"Processing: color={self.target_color}, num={self.target_num}")
-            
-            # 启动检测
+            cmd = json.loads(request.data)
+            targets_data = cmd.get("targets")
+            if not isinstance(targets_data, list) or not targets_data:
+                raise ValueError("缺少 targets 列表")
+
+            targets = []
+            for t in targets_data:
+                color = t.get("color")
+                num = t.get("num")
+                if not color or num is None:
+                    raise ValueError(f"target 缺少 color/num: {t}")
+                targets.append({"color": str(color).lower(), "num": int(num)})
+
+            # 数量多者先抓
+            self.targets = sorted(targets, key=lambda t: -t["num"])
+            self.get_logger().info(
+                "抓取顺序: " + ", ".join(f"{t['color']}:{t['num']}" for t in self.targets)
+            )
+
+            # 启动检测，拿到当前画面方块后开始抓
             self.restart_detection(done_cb=self.process_restart_result)
             response.success = True
             response.message = "Command received, restart_detection in progress"
-
         except Exception as e:
             self.get_logger().error(f"Error processing request: {str(e)}")
             response.success = False
             response.message = str(e)
-
         return response
 
     def process_restart_result(self, future):
         result: Trigger.Response = future.result()
-        self.get_logger().info(f"Restart detection result: {result}")
+        self.get_logger().info("Restart detection result received")
 
-        self.blocks_data = json.loads(result.message)
-        current_pose = self.robot.get_tools_pos()
-
-        if current_pose == -1:
-            self.get_logger().error("Failed to get current tool position")
+        try:
+            self.blocks_data = json.loads(result.message)
+        except Exception:
+            self.get_logger().error(f"解析方块结果失败: {result.message}")
+            self.publish_panel(status="待命")
             return
 
-        # 初始化两个列表：目标颜色和其他颜色
-        target_list = []  # 目标颜色的方块
-        other_list = []   # 其他颜色的方块
+        current_pose = self.robot.get_tools_pos()
+        if current_pose == -1:
+            self.get_logger().error("Failed to get current tool position")
+            self.publish_panel(status="待命")
+            return
 
-        # 转换坐标系并分类
+        # 转换坐标系并按颜色分组
+        color_blocks = {}
         for item in self.blocks_data:
             pos = tool_to_base(item["tool_pos"], current_pose)
             color = item["color"]
-            
-            # 记录转换后的位置和颜色
             self.get_logger().info(f"item_pos: {item['tool_pos']}, pos: {pos}, color: {color}")
-            
-            # 分类存储
-            if color == self.target_color:
-                target_list.append((pos, color))
-            else:
-                other_list.append((pos, color))
+            color_blocks.setdefault(color, []).append(pos)
 
-        # 创建最终抓取列表（目标颜色在前，其他颜色在后）
-        pos_lists = []
-        # 添加目标颜色方块（最多self.target_num个）
-        pos_lists.extend(target_list[:self.target_num])
-        # 添加其他颜色方块（最多self.other_num个）
-        pos_lists.extend(other_list[:self.other_num])
+        # 按「数量多者先抓」的目标顺序，构建抓取序列
+        pick_list = []  # [(base_pos, color), ...]
+        for t in self.targets:
+            available = color_blocks.get(t["color"], [])
+            pick_list.extend((pos, t["color"]) for pos in available[: t["num"]])
 
-        # 如果总数不足5个，记录警告
-        if len(pos_lists) < 5:
-            self.get_logger().warn(f"Only found {len(pos_lists)} blocks, expected 5")
+        if not pick_list:
+            self.get_logger().warn("没有可抓的方块")
+            self.publish_panel(status="待命")
+            return
 
-        # 执行抓取操作
+        # 执行抓取操作（真实抓取时把进度/状态实时刷到面板）
         self.robot.pick_init()
-        for pos, color in pos_lists:
-            self.get_logger().info(f"Picking block of color: {color}")
+        for i, (pos, color) in enumerate(pick_list, 1):
+            # 吸盘空，前往抓取
+            self.publish_panel(progress=f"第{i}个", current="前往抓取", status="前往抓取")
+            self.get_logger().info(f"抓取第{i}个：{color}")
             self.pick(pos[0], pos[1], pos[2])
         self.robot.pick_end()
         self.robot.go_home()
+        # 全部完成，回待命
+        self.publish_panel(status="待命", current="已完成")
 
     def move_to_point(self, x, y, z):
         """
@@ -222,13 +205,22 @@ class Connecter(Node):
             self.get_logger().error(f"some things happend,the errcode is:{ret}")
             return False
 
+    def publish_panel(self, progress=None, current=None, status=None):
+        """实时刷新面板动态字段（只发传入的非空字段）。"""
+        if progress is not None:
+            self.pub_progress.publish(String(data=progress))
+        if current is not None:
+            self.pub_current.publish(String(data=current))
+        if status is not None:
+            self.pub_status.publish(String(data=status))
+
     def pick(self, x, y, z):
         """
-        先移动到指定位置,执行pick on操作,移动到目标位置,执行pick off操作
+        先移动到指定位置(前往抓取),执行 pick on 吸取(前往放置),移动到放置位, pick off 释放。
         """
-        # 移动到指定位置
+        # 移动到指定位置（吸盘空）
         offset_x = 0
-        if y>0:
+        if y > 0:
             offset_y = -5
         else:
             offset_y = -6
@@ -237,9 +229,11 @@ class Connecter(Node):
         ):
             sleep(1)
             self.robot.do_pick_on(self.end_move_z)
+            # 吸盘已吸住，前往放置
+            self.publish_panel(current="前往放置", status="前往放置")
         else:
             return False
-        # 移动到仓库位置
+        # 移动到放置位置（只有一个放置区）
         sleep(1)
         if self.robot.go_pose(self.back_pose):
             # 吸盘松开
