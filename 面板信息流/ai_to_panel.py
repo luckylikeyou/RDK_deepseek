@@ -69,10 +69,10 @@ def build_panel_state(counts):
         '先抓取': CN.get(first, first),
         '后抓取': CN.get(second, second),
         '任务进度': '第1个',
-        # 状态只有两种：待命（等待解题）/ 执行（结果出来，机械臂开始运行）
-        # 当前任务三种：前往资源点 → 抓取资源 → 前往放置区
-        '当前任务': '前往资源点',
-        '状态': '执行',
+        # 动态字段（任务进度/当前任务/状态）在真实抓取时由 connecter 接管：
+        #   状态 = 前往抓取（吸盘空）/ 前往放置（吸盘有物块）；全部放完回 待命
+        '当前任务': '前往抓取',
+        '状态': '待命',
     }
     return {
         'labels': labels,
@@ -166,9 +166,6 @@ def publish_state(node, state, pubs=None):
         pubs['blue'].publish(Int32(data=counts['blue']))
     pubs['first'].publish(String(data=labels['先抓取']))
     pubs['second'].publish(String(data=labels['后抓取']))
-    pubs['progress'].publish(String(data=labels['任务进度']))
-    pubs['current'].publish(String(data=labels['当前任务']))
-    pubs['status'].publish(String(data=labels['状态']))
     pubs['plan'].publish(String(data=json.dumps({
         'order': state['order'],
         'seq': state['seq'],
@@ -181,6 +178,19 @@ def publish_state(node, state, pubs=None):
             pubs['blocks'].publish(arr)
 
     return labels
+
+
+def publish_idle_dynamic(pubs):
+    """把动态字段（任务进度/当前任务/状态）复位回「待命」。
+
+    真实抓取时这三个字段由 connecter 节点接管（前往抓取 / 前往放置），这里只在
+    新答案到来时把面板复位一次，避免残留上一轮抓取的状态。复位后不再重发动态
+    字段，防止把 connecter 的实时进度覆盖掉。
+    """
+    from std_msgs.msg import String
+    pubs['progress'].publish(String(data="第1个"))
+    pubs['current'].publish(String(data="前往抓取"))
+    pubs['status'].publish(String(data="待命"))
 
 
 def _simulate(node, state, pubs=None):
@@ -246,6 +256,7 @@ def _watch(rclpy, path):
                         else:
                             last_state = build_panel_state(counts)
                             labels = publish_state(node, last_state, pubs)
+                            publish_idle_dynamic(pubs)
                             print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
                     else:
                         print(f"文件内容与上次相同（答案没变），跳过：{content[:40]!r}")
@@ -291,6 +302,7 @@ def main():
     state = build_panel_state(counts)
     pubs = make_publishers(node)
     labels = publish_state(node, state, pubs)
+    publish_idle_dynamic(pubs)
     print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
 
     if args.simulate:
