@@ -155,6 +155,11 @@ class Connecter(Node):
             self.publish_panel(status="待命")
             return
 
+        self.get_logger().info(
+            f"收到 {len(self.blocks_data)} 个方块: "
+            f"{[(b.get('color'), b.get('tool_pos')) for b in self.blocks_data]}"
+        )
+
         current_pose = self.robot.get_tools_pos()
         if current_pose == -1:
             self.get_logger().error("Failed to get current tool position")
@@ -180,11 +185,16 @@ class Connecter(Node):
             self.publish_panel(status="待命")
             return
 
+        self.get_logger().info(f"待抓取序列共 {len(pick_list)} 个: {[c for _, c in pick_list]}")
+
         # 执行抓取操作（真实抓取时把进度/状态实时刷到面板）
         self.robot.pick_init()
         for i, (pos, color) in enumerate(pick_list, 1):
             self.get_logger().info(f"抓取第{i}个：{color}")
-            self.pick(pos[0], pos[1], pos[2], i)
+            try:
+                self.pick(pos[0], pos[1], pos[2], i)
+            except Exception as e:
+                self.get_logger().error(f"抓取第{i}个({color})异常：{e}")
         self.robot.pick_end()
         self.robot.go_home()
         # 全部完成，回待命
