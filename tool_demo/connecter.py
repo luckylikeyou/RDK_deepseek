@@ -13,7 +13,7 @@
     - 移动到放置位置（只有一个放置区）
     - 释放
  - 真实抓取时把 任务进度/当前任务/状态 实时刷到面板：
-    - 状态 = 前往抓取（吸盘上没物块）/ 前往放置（吸盘上有物块）
+    - 状态 = 运行（抓取中）；当前任务 = 前往资源点 / 抓取资源点 / 前往放置区
 """
 
 import json
@@ -183,14 +183,12 @@ class Connecter(Node):
         # 执行抓取操作（真实抓取时把进度/状态实时刷到面板）
         self.robot.pick_init()
         for i, (pos, color) in enumerate(pick_list, 1):
-            # 吸盘空，前往抓取
-            self.publish_panel(progress=f"第{i}个", current="前往抓取", status="前往抓取")
             self.get_logger().info(f"抓取第{i}个：{color}")
-            self.pick(pos[0], pos[1], pos[2])
+            self.pick(pos[0], pos[1], pos[2], i)
         self.robot.pick_end()
         self.robot.go_home()
         # 全部完成，回待命
-        self.publish_panel(status="待命", current="已完成")
+        self.publish_panel(status="待命", current="")
 
     def move_to_point(self, x, y, z):
         """
@@ -214,32 +212,31 @@ class Connecter(Node):
         if status is not None:
             self.pub_status.publish(String(data=status))
 
-    def pick(self, x, y, z):
+    def pick(self, x, y, z, index):
         """
-        先移动到指定位置(前往抓取),执行 pick on 吸取(前往放置),移动到放置位, pick off 释放。
+        抓取一个方块，面板按三态刷新：前往资源点 -> 抓取资源点 -> 前往放置区，
+        状态全程为「运行」。
         """
-        # 移动到指定位置（吸盘空）
+        # 1. 前往资源点
+        self.publish_panel(progress=f"第{index}个", current="前往资源点", status="运行")
         offset_x = 0
-        if y > 0:
-            offset_y = -5
-        else:
-            offset_y = -6
-        if self.move_to_point(
+        offset_y = -5 if y > 0 else -6
+        if not self.move_to_point(
             x * 1000 + offset_x, y * 1000 + offset_y, self.end_pose_z
         ):
-            sleep(1)
-            self.robot.do_pick_on(self.end_move_z)
-            # 吸盘已吸住，前往放置
-            self.publish_panel(current="前往放置", status="前往放置")
-        else:
             return False
-        # 移动到放置位置（只有一个放置区）
         sleep(1)
-        if self.robot.go_pose(self.back_pose):
-            # 吸盘松开
-            self.robot.pick_off()
-        else:
+
+        # 2. 抓取资源点（吸取）
+        self.publish_panel(current="抓取资源点", status="运行")
+        self.robot.do_pick_on(self.end_move_z)
+        sleep(1)
+
+        # 3. 前往放置区（只有一个放置区）
+        self.publish_panel(current="前往放置区", status="运行")
+        if not self.robot.go_pose(self.back_pose):
             return False
+        self.robot.pick_off()
         return True
 
 

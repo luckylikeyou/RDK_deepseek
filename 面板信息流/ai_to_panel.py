@@ -70,8 +70,8 @@ def build_panel_state(counts):
         '后抓取': CN.get(second, second),
         '任务进度': '第1个',
         # 动态字段（任务进度/当前任务/状态）在真实抓取时由 connecter 接管：
-        #   状态 = 前往抓取（吸盘空）/ 前往放置（吸盘有物块）；全部放完回 待命
-        '当前任务': '前往抓取',
+        #   状态 = 运行；当前任务 = 前往资源点 / 抓取资源点 / 前往放置区；放完回 待命
+        '当前任务': '',
         '状态': '待命',
     }
     return {
@@ -183,14 +183,55 @@ def publish_state(node, state, pubs=None):
 def publish_idle_dynamic(pubs):
     """把动态字段（任务进度/当前任务/状态）复位回「待命」。
 
-    真实抓取时这三个字段由 connecter 节点接管（前往抓取 / 前往放置），这里只在
-    新答案到来时把面板复位一次，避免残留上一轮抓取的状态。复位后不再重发动态
-    字段，防止把 connecter 的实时进度覆盖掉。
+    真实抓取时这三个字段由 connecter 节点接管（运行 / 前往资源点 / 抓取资源点 /
+    前往放置区），这里只在新答案到来时把面板复位一次，避免残留上一轮抓取的状态。
+    复位后不再重发动态字段，防止把 connecter 的实时进度覆盖掉。
     """
     from std_msgs.msg import String
     pubs['progress'].publish(String(data="第1个"))
-    pubs['current'].publish(String(data="前往抓取"))
+    pubs['current'].publish(String(data=""))
     pubs['status'].publish(String(data="待命"))
+
+
+def dispatch_to_arm(node, rclpy, counts):
+    """把解析结果转成 /send_command 的 targets JSON，派单给机械臂抓取。
+
+    一次新答案只派一次（由调用方保证）。counts = {'yellow': N, 'blue': M}，
+    None 表示该颜色没出现。机械臂侧 connecter 收到后按「数量多者先抓」执行，
+    并实时刷面板的 任务进度/当前任务/状态（前往资源点/抓取资源点/前往放置区）。
+    """
+    try:
+        from custom_msgs.srv import StrMsg
+    except ImportError:
+        print("⚠️ 未找到 custom_msgs，跳过机械臂派单（需 source ~/code_ws/install）",
+              file=sys.stderr)
+        return False
+
+    targets, total = [], 0
+    for color in ('yellow', 'blue'):
+        num = counts.get(color)
+        if num is not None and num > 0:
+            targets.append({"color": color, "num": int(num)})
+            total += int(num)
+    if not targets:
+        print("⚠️ 黄/蓝数量都为空，跳过机械臂派单", file=sys.stderr)
+        return False
+
+    targets.sort(key=lambda t: -t["num"])   # 数量多者先抓
+    data = json.dumps({"targets": targets, "total": total}, ensure_ascii=False)
+
+    client = node.create_client(StrMsg, "/send_command")
+    if not client.wait_for_service(timeout_sec=3.0):
+        print("⚠️ /send_command 服务未就绪（connecter 未启动或机械臂未登录），跳过派单",
+              file=sys.stderr)
+        return False
+
+    req = StrMsg.Request()
+    req.data = data
+    future = client.call_async(req)
+    rclpy.spin_until_future_complete(node, future, timeout_sec=5.0)
+    print(f"→ 已派单给机械臂：{data}")
+    return True
 
 
 def _simulate(node, state, pubs=None):
@@ -258,6 +299,7 @@ def _watch(rclpy, path):
                             labels = publish_state(node, last_state, pubs)
                             publish_idle_dynamic(pubs)
                             print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
+                            dispatch_to_arm(node, rclpy, counts)
                     else:
                         print(f"文件内容与上次相同（答案没变），跳过：{content[:40]!r}")
             # 常驻重发兜底：transient_local 之外再每 0.5s 重发一次，双保险
