@@ -53,7 +53,7 @@ class Connecter(Node):
 
         # 末端位置，拾取移动距离 单位mm
         self.end_pose_z = 120.0
-        self.end_move_z = -8
+        self.end_move_z = -2
 
         self.command = {}
         self.srv_ser = self.create_service(
@@ -229,8 +229,8 @@ class Connecter(Node):
         """
         # 1. 前往资源点
         self.publish_panel(progress=f"第{index}个", current="前往资源点", status="运行")
-        offset_x = 0
-        offset_y = -5 if y > 0 else -6
+        offset_x = -70
+        offset_y = -30 if y > 0 else -6
         if not self.move_to_point(
             x * 1000 + offset_x, y * 1000 + offset_y, self.end_pose_z
         ):

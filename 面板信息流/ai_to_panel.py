@@ -289,19 +289,17 @@ def _watch(rclpy, path):
                     time.sleep(0.05)   # 等 50ms（deepseek 单次 write+close，几乎无半截风险）
                     with open(path, 'r', encoding='utf-8') as f:
                         content = f.read().strip()
-                    if content != last_content:
-                        last_content = content
-                        counts = parse_ai_answer(content)
-                        if counts['yellow'] is None and counts['blue'] is None:
-                            print(f"⚠️ 未解析到答案：{content[:80]!r}", file=sys.stderr)
-                        else:
-                            last_state = build_panel_state(counts)
-                            labels = publish_state(node, last_state, pubs)
-                            publish_idle_dynamic(pubs)
-                            print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
-                            dispatch_to_arm(node, rclpy, counts)
+                    # 文件被重写（mtime 变了）就重新派单：即使题目/答案与上一题完全相同，
+                    # 机械臂也要重新完整执行一遍（比赛要求）。
+                    counts = parse_ai_answer(content)
+                    if counts['yellow'] is None and counts['blue'] is None:
+                        print(f"⚠️ 未解析到答案：{content[:80]!r}", file=sys.stderr)
                     else:
-                        print(f"文件内容与上次相同（答案没变），跳过：{content[:40]!r}")
+                        last_state = build_panel_state(counts)
+                        labels = publish_state(node, last_state, pubs)
+                        publish_idle_dynamic(pubs)
+                        print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
+                        dispatch_to_arm(node, rclpy, counts)
             # 常驻重发兜底：transient_local 之外再每 0.5s 重发一次，双保险
             if last_state is not None and time.time() - last_pub >= 0.5:
                 publish_state(node, last_state, pubs)
