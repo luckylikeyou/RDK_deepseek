@@ -43,9 +43,9 @@ INCR = 1  # 增量位置
 
 class Connecter(Node):
     # 手眼标定残差校正（由 calib_correct.py 算出）：绕基座Z轴旋转 θ 度 + 平移 (mm)
-    CORRECT_THETA =  0.839   # 度
-    CORRECT_TX =  -6.33      # mm
-    CORRECT_TY =  -14.94       # mm
+    CORRECT_THETA =  3.386   # 度
+    CORRECT_TX =  -2.03      # mm
+    CORRECT_TY =  0.68       # mm
 
     def __init__(self):
         super().__init__("connecter")
@@ -199,9 +199,18 @@ class Connecter(Node):
         for i, (pos, color) in enumerate(pick_list, 1):
             self.get_logger().info(f"抓取第{i}个：{color}")
             try:
-                self.pick(pos[0], pos[1], pos[2], i)
+                ok = self.pick(pos[0], pos[1], pos[2], i)
             except Exception as e:
                 self.get_logger().error(f"抓取第{i}个({color})异常：{e}")
+                ok = False
+            if not ok:
+                # 放了不成功就停下报错：必须先把吸盘释放掉，
+                # 否则就会带着物块去下一个物块（原来的毛病）
+                self.get_logger().error(
+                    f"抓取第{i}个({color})未完成，停止后续抓取（看上面一行错误码/异常）"
+                )
+                self.robot.pick_off()
+                break
         self.robot.pick_end()
         self.robot.go_home()
         # 全部完成，回待命
@@ -252,7 +261,7 @@ class Connecter(Node):
         # 1. 前往资源点
         self.publish_panel(progress=f"第{index}个", current="前往资源点", status="运行")
         offset_x = 4
-        offset_y = 0 if y > 0 else -6
+        offset_y = -3 if y > 0 else -6
         if not self.move_to_point(
             x * 1000 + offset_x, y * 1000 + offset_y, self.end_pose_z
         ):
@@ -265,11 +274,15 @@ class Connecter(Node):
         sleep(1)
 
         # 3. 前往放置区（只有一个放置区）
+        #    无论成功失败都必须释放吸盘：绝不吸着物块去下一个物块
         self.publish_panel(current="前往放置区", status="运行")
-        if not self.robot.go_pose(self.back_pose):
-            return False
+        ret = self.robot.go_pose(self.back_pose)
+        if isinstance(ret, tuple) and ret[0] != 0:
+            self.get_logger().error(f"前往放置区失败: {ret}")
         self.robot.pick_off()
-        return True
+        # 释放后抬起来，避免吸盘擦着物块/桌面移动
+        self.robot.robot.linear_move([0, 0, 50, 0, 0, 0], INCR, True, 30)
+        return not (isinstance(ret, tuple) and ret[0] != 0)
 
 
 def main(args=None):
