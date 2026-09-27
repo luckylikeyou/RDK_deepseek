@@ -23,7 +23,6 @@ from sensor_msgs.msg import Image, CompressedImage
 
 import numpy as np
 from cv_bridge import CvBridge
-from rclpy.qos import qos_profile_sensor_data
 
 from tools_demo.modules.tools import (
     get_color,
@@ -51,7 +50,7 @@ class DetectionTFBroadcaster(Node):
             Image,
             "/camera/aligned_depth_to_color/image_raw",
             self.depth_image_callback,
-            qos_profile_sensor_data,
+            10,
         )
 
         # 彩色图像
@@ -59,7 +58,7 @@ class DetectionTFBroadcaster(Node):
             CompressedImage,
             "/camera/color/image_raw/compressed",
             self.color_image_callback,
-            qos_profile_sensor_data,
+            10,
         )
 
         self.color_image_ = None
@@ -67,9 +66,6 @@ class DetectionTFBroadcaster(Node):
 
         # 图像参数
         self.depth_image = None
-        self._depth_received = False
-        self._color_received = False
-        self._last_blocks_str = None
         self.bridge = CvBridge()
 
         self.T_tool_cam = create_handeye_matrix()
@@ -98,16 +94,12 @@ class DetectionTFBroadcaster(Node):
             return
 
         new_blocks = []  # 本次回调检测到的新方块
-        raw_block_rois = 0  # 过滤前的 block ROI 数量（诊断用）
 
         for target in msg.targets:
             target: Target
             for roi in target.rois:
                 roi: Roi
-                if roi.type != "block":
-                    continue
-                raw_block_rois += 1
-                if roi.confidence < 0.35:
+                if roi.type != "block" or roi.confidence < 0.55:
                     continue
 
                 # 计算中心像素坐标（彩色图像）
@@ -163,34 +155,15 @@ class DetectionTFBroadcaster(Node):
         # 添加新检测到的方块
         self.detected_blocks.extend(new_blocks)
 
-        # 节流诊断：检测结果变化时打印一次（原始ROI数 / 通过过滤数 / 颜色）
-        summary = (
-            f"原始block ROI={raw_block_rois}, 通过={len(self.detected_blocks)}, "
-            f"颜色={[b['color'] for b in self.detected_blocks]}"
-        )
-        if summary != self._last_blocks_str:
-            self._last_blocks_str = summary
-            self.get_logger().info(f"检测: {summary}")
-
     def depth_image_callback(self, msg):
         try:
             self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="mono16")
-            if not self._depth_received:
-                self._depth_received = True
-                self.get_logger().info(
-                    f"Depth image received (QoS OK), shape={self.depth_image.shape}"
-                )
         except Exception as e:
             self.get_logger().error(f"Error converting depth image: {e}")
 
     def color_image_callback(self, msg):
         try:
             self.color_image_ = self.bridge.compressed_imgmsg_to_cv2(msg, "bgr8")
-            if not self._color_received:
-                self._color_received = True
-                self.get_logger().info(
-                    f"Color image received, shape={self.color_image_.shape}"
-                )
         except Exception as e:
             self.get_logger().error(f"Error converting color image: {e}")
 
@@ -198,7 +171,30 @@ class DetectionTFBroadcaster(Node):
         """根据ROI获取颜色"""
         if self.color_image_ is None:
             return "no_image"
-        return get_color(self.color_image_, roi)
+        color = get_color(self.color_image_, roi)
+        # === 调试：打印 ROI 位置、蓝/黄像素占比、中心像素的真实颜色 ===
+        #     用来判断是「采错位置」还是「HSV 判错」。定位完可以删掉这段。
+        try:
+            from tools_demo.modules.tools import Params
+
+            x, y, w, h = [int(v) for v in roi]
+            sub = self.color_image_[y : y + h, x : x + w]
+            if sub.size:
+                hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+                mb = cv2.countNonZero(cv2.inRange(hsv, Params.lower_blue, Params.upper_blue))
+                my = cv2.countNonZero(
+                    cv2.inRange(hsv, Params.lower_yellow, Params.upper_yellow)
+                )
+                tot = w * h
+                cy, cx = h // 2, w // 2
+                self.get_logger().info(
+                    f"[颜色调试] rect=({x},{y},{w},{h}) 图像={self.color_image_.shape} "
+                    f"判定={color} blue占比={mb / tot:.2f} yellow占比={my / tot:.2f} "
+                    f"中心BGR={sub[cy, cx].tolist()} 中心HSV={hsv[cy, cx].tolist()}"
+                )
+        except Exception as e:
+            self.get_logger().error(f"颜色调试失败: {e}")
+        return color
 
     def save_to_parameter_server(self):
         """将检测结果保存到参数服务器"""
@@ -243,7 +239,7 @@ class DetectionTFBroadcaster(Node):
         )
         return self.detected_blocks_str
 
-    def is_new_block(self, position, min_distance=0.05):
+    def is_new_block(self, position, min_distance=0.03):
         """检查是否是新方块（避免重复检测）"""
         for block in self.detected_blocks:
             existing_pos = block["tool_pos"]

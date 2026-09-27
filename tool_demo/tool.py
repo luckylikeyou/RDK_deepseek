@@ -29,8 +29,9 @@ class Params:
     handeye_rotation_euler = np.array([2.02147, -1.4809, -88.707])  # 单位：度
 
     # 定义蓝色和黄色的HSV范围（OpenCV中H范围是0-180）
-    # 蓝色范围 (90-135)：实测蓝块偏青（H≈97），原 100 下限会漏掉真蓝块
-    lower_blue = np.array([90, 50, 50])
+    # 蓝色范围：实测蓝色物块 H≈95，原来的下限 100 太高，会把蓝色判成 other/黄色（还会来回闪），
+    #           所以下限降到 80，给光照波动留余量
+    lower_blue = np.array([80, 50, 50])
     upper_blue = np.array([135, 255, 255])
 
     # 黄色范围 (20-40)

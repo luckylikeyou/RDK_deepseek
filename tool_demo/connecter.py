@@ -21,6 +21,7 @@ import math
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSHistoryPolicy
 from custom_msgs.srv import StrMsg
 from std_srvs.srv import Trigger
 from std_msgs.msg import String
@@ -72,9 +73,15 @@ class Connecter(Node):
         self.targets = []  # 多目标 [{"color":"yellow","num":2}, ...]，按数量降序
 
         # 面板动态字段发布（真实抓取时实时刷新 任务进度/当前任务/状态）
-        self.pub_progress = self.create_publisher(String, "/task/progress", 10)
-        self.pub_current = self.create_publisher(String, "/task/current_task", 10)
-        self.pub_status = self.create_publisher(String, "/task/status", 10)
+        # 面板订阅读的是 TRANSIENT_LOCAL，这里必须一致，否则 QoS 不兼容、面板收不到任何消息
+        panel_qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.pub_progress = self.create_publisher(String, "/task/progress", panel_qos)
+        self.pub_current = self.create_publisher(String, "/task/current_task", panel_qos)
+        self.pub_status = self.create_publisher(String, "/task/status", panel_qos)
 
     def robot_is_ready(self):
         ret = False
@@ -260,8 +267,8 @@ class Connecter(Node):
         """
         # 1. 前往资源点
         self.publish_panel(progress=f"第{index}个", current="前往资源点", status="运行")
-        offset_x = 4
-        offset_y = -3 if y > 0 else -6
+        offset_x = 0
+        offset_y = -4 if y > 0 else -6
         if not self.move_to_point(
             x * 1000 + offset_x, y * 1000 + offset_y, self.end_pose_z
         ):
