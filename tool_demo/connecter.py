@@ -17,6 +17,7 @@
 """
 
 import json
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -41,6 +42,11 @@ INCR = 1  # 增量位置
 
 
 class Connecter(Node):
+    # 手眼标定残差校正（由 calib_correct.py 算出）：绕基座Z轴旋转 θ 度 + 平移 (mm)
+    CORRECT_THETA =  0.839   # 度
+    CORRECT_TX =  -6.33      # mm
+    CORRECT_TY =  -14.94       # mm
+
     def __init__(self):
         super().__init__("connecter")
         self.robot = Jaka()  # 返回一个机器人对象
@@ -53,7 +59,7 @@ class Connecter(Node):
 
         # 末端位置，拾取移动距离 单位mm
         self.end_pose_z = 120.0
-        self.end_move_z = -2
+        self.end_move_z = -11
 
         self.command = {}
         self.srv_ser = self.create_service(
@@ -170,6 +176,7 @@ class Connecter(Node):
         color_blocks = {}
         for item in self.blocks_data:
             pos = tool_to_base(item["tool_pos"], current_pose)
+            pos = self.correct_pos(pos)  # 补偿手眼标定残差（旋转+平移）
             color = item["color"]
             self.get_logger().info(f"item_pos: {item['tool_pos']}, pos: {pos}, color: {color}")
             color_blocks.setdefault(color, []).append(pos)
@@ -213,6 +220,21 @@ class Connecter(Node):
             self.get_logger().error(f"some things happend,the errcode is:{ret}")
             return False
 
+    def correct_pos(self, pos):
+        """对计算出的基座坐标施加旋转+平移校正，补偿手眼标定残差。
+        pos 单位米，返回校正后的 [x, y, z]（米）。
+        """
+        x = pos[0] * 1000.0
+        y = pos[1] * 1000.0
+        th = math.radians(self.CORRECT_THETA)
+        xr = x * math.cos(th) - y * math.sin(th)
+        yr = x * math.sin(th) + y * math.cos(th)
+        return [
+            (xr + self.CORRECT_TX) / 1000.0,
+            (yr + self.CORRECT_TY) / 1000.0,
+            pos[2],
+        ]
+
     def publish_panel(self, progress=None, current=None, status=None):
         """实时刷新面板动态字段（只发传入的非空字段）。"""
         if progress is not None:
@@ -229,8 +251,8 @@ class Connecter(Node):
         """
         # 1. 前往资源点
         self.publish_panel(progress=f"第{index}个", current="前往资源点", status="运行")
-        offset_x = -70
-        offset_y = -30 if y > 0 else -6
+        offset_x = 4
+        offset_y = 0 if y > 0 else -6
         if not self.move_to_point(
             x * 1000 + offset_x, y * 1000 + offset_y, self.end_pose_z
         ):
