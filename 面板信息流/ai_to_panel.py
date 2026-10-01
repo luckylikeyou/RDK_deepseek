@@ -41,6 +41,43 @@ BLOCK_COLOR = {
     'blue':   (0.17, 0.35, 0.93, 1.0),   # 蓝
 }
 
+PROBLEM_TOPIC = "/task/problem"
+
+
+def read_question_file(path):
+    """读题目文件：GBK 解码、去「题目: 」前缀，返回干净题目文本。
+
+    题目文件由 `./TMSCQtest_arm.bin > /tmp/question.txt` 生成（GBK 字节、带「题目: 」前缀）。
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    text = None
+    for enc in ("gbk", "utf-8"):
+        try:
+            text = raw.decode(enc).strip()
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = raw.decode("utf-8", errors="replace").strip()
+    text = text.strip().lstrip("\ufeff")
+    for prefix in ("题目:", "题目："):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text.strip()
+
+
+def build_result_text(counts):
+    """{yellow, blue}（值可能为 None）→ "结果：黄色N个、蓝色M个"；全空返回空串。"""
+    parts = []
+    for c in ("yellow", "blue"):
+        n = counts.get(c)
+        if n is not None:
+            parts.append(f"{CN[c]}{n}个")
+    if not parts:
+        return ""
+    return "结果：" + "、".join(parts)
 
 def build_panel_state(counts):
     """纯函数：{yellow, blue} -> 面板状态。
@@ -140,7 +177,9 @@ def make_publishers(node):
         'current':  node.create_publisher(String, '/task/current_task', qos),
         'status':   node.create_publisher(String, '/task/status', qos),
         'plan':     node.create_publisher(String, '/task/plan', qos),
+        'problem':  node.create_publisher(String, PROBLEM_TOPIC, qos),
     }
+    
     try:
         from visualization_msgs.msg import MarkerArray
         pubs['blocks'] = node.create_publisher(MarkerArray, '/task/blocks', qos)
@@ -265,32 +304,52 @@ def _simulate(node, state, pubs=None):
         pass
 
 
-def _watch(rclpy, path):
-    """监听文件：内容变化后稳定 50ms 才解析发布；并每 0.5s 重发最近结果兜底。
+def _watch(rclpy, path, question_path=None):
+    """监听答案文件（+ 可选题目文件），内容变化后解析发布；每 0.5s 重发兜底。
 
-    为什么常驻重发：std_msgs 主题是易失的（不缓存历史），coStudio 一旦重连 / 重新导入
-    布局，之前发过的消息就收不到了。发布器已用 transient_local QoS 保留最后值，这里
-    再每 0.5s 重发一遍双保险，保证面板任何时候都能在 0.5s 内同步回最新值。
+    question_path：题目文件（如 /tmp/question.txt），变化即把题目发到 /task/problem；
+    答案变化时把「结果」追加到题目后面一起发。
     """
     from rclpy.node import Node
+    from std_msgs.msg import String
     last_mtime = None
-    last_content = None
     last_state = None
     last_pub = 0.0
+
+    # 题目显示状态
+    problem_text = ""          # 当前题目原文
+    problem_message = ""       # 发到 /task/problem 的完整内容（题目 + 结果）
+    last_q_mtime = None
+
     node = Node('ai_to_panel')
-    pubs = make_publishers(node)   # 提前建好，让 /task/* 主题一开跑就存在
-    print(f"监听 {path} ...（每 0.5s 重发最近结果兜底，Ctrl+C 停止）")
+    pubs = make_publishers(node)
+    if question_path:
+        print(f"监听题目 {question_path} ...")
+    print(f"监听答案 {path} ...（每 0.5s 重发兜底，Ctrl+C 停止）")
     try:
         while True:
+            # ---- 题目文件：mtime 变了就重新上屏 ----
+            if question_path and os.path.exists(question_path):
+                q_mtime = os.path.getmtime(question_path)
+                if q_mtime != last_q_mtime:
+                    last_q_mtime = q_mtime
+                    time.sleep(0.05)   # 等生成器写完整（> 会先截断再写）
+                    problem_text = read_question_file(question_path)
+                    if not problem_text:
+                        print("⚠️ 题目文件为空（可能生成器还没写完），跳过", file=sys.stderr)
+                    else:
+                        problem_message = problem_text   # 新题清掉旧结果
+                        pubs['problem'].publish(String(data=problem_message))
+                        print(f"已发布题目到 {PROBLEM_TOPIC}：{problem_text}")
+
+            # ---- 答案文件：mtime 变了就解析 + 派单 ----
             if os.path.exists(path):
                 mtime = os.path.getmtime(path)
                 if mtime != last_mtime:
                     last_mtime = mtime
-                    time.sleep(0.05)   # 等 50ms（deepseek 单次 write+close，几乎无半截风险）
+                    time.sleep(0.05)
                     with open(path, 'r', encoding='utf-8') as f:
                         content = f.read().strip()
-                    # 文件被重写（mtime 变了）就重新派单：即使题目/答案与上一题完全相同，
-                    # 机械臂也要重新完整执行一遍（比赛要求）。
                     counts = parse_ai_answer(content)
                     if counts['yellow'] is None and counts['blue'] is None:
                         print(f"⚠️ 未解析到答案：{content[:80]!r}", file=sys.stderr)
@@ -300,9 +359,19 @@ def _watch(rclpy, path):
                         publish_idle_dynamic(pubs)
                         print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
                         dispatch_to_arm(node, rclpy, counts)
-            # 常驻重发兜底：transient_local 之外再每 0.5s 重发一次，双保险
-            if last_state is not None and time.time() - last_pub >= 0.5:
-                publish_state(node, last_state, pubs)
+                        # 结果追加到题目后面，一起发到「题目」面板
+                        result = build_result_text(counts)
+                        if result and problem_text:
+                            problem_message = f"{problem_text}\n{result}"
+                            pubs['problem'].publish(String(data=problem_message))
+                            print(f"已追加结果到题目：{result}")
+
+            # ---- 兜底重发 ----
+            if time.time() - last_pub >= 0.5:
+                if last_state is not None:
+                    publish_state(node, last_state, pubs)
+                if problem_message:
+                    pubs['problem'].publish(String(data=problem_message))
                 last_pub = time.time()
             time.sleep(0.05)
     except KeyboardInterrupt:
@@ -313,20 +382,22 @@ def main():
     ap = argparse.ArgumentParser(description='把 AI 解题结果实时发布到 ROS / coStudio')
     ap.add_argument('result', nargs='?', help='AI 解题结果，如 "{color:yellow,num:4},{color:blue,num:1}"')
     ap.add_argument('--simulate', action='store_true', help='2s/步模拟抓取进度')
-    ap.add_argument('--watch', help='监听文件，内容稳定 300ms 后解析发布')
+    ap.add_argument('--watch', help='监听答案文件，内容变化后解析发布')
+    ap.add_argument('--question', help='监听题目文件（如 /tmp/question.txt），变化即发 /task/problem')
     args = ap.parse_args()
 
     import rclpy
     rclpy.init(args=sys.argv[1:1])
 
     if args.watch:
-        _watch(rclpy, args.watch)
+        _watch(rclpy, args.watch, args.question)
         rclpy.shutdown()
         return
 
     if not args.result:
         print("用法：python3 ai_to_panel.py \"{color:yellow,num:4},{color:blue,num:1}\" [--simulate]")
         print("      python3 ai_to_panel.py --watch /tmp/ai_answer.txt")
+        print("      python3 ai_to_panel.py --watch /tmp/ai_answer.txt --question /tmp/question.txt")
         rclpy.shutdown()
         sys.exit(1)
 

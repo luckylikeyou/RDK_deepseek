@@ -44,9 +44,9 @@ INCR = 1  # 增量位置
 
 class Connecter(Node):
     # 手眼标定残差校正（由 calib_correct.py 算出）：绕基座Z轴旋转 θ 度 + 平移 (mm)
-    CORRECT_THETA =  3.386   # 度
-    CORRECT_TX =  -2.03      # mm
-    CORRECT_TY =  0.68       # mm
+    CORRECT_THETA =  2.406   # 度
+    CORRECT_TX =  -5.34      # mm
+    CORRECT_TY =  -6.01        # mm
 
     def __init__(self):
         super().__init__("connecter")
@@ -56,7 +56,13 @@ class Connecter(Node):
             return
 
         # 放置区（只有一个位置）
-        self.back_pose = [-31.20, 374.393, 143.20, 180, 0.0, 0.0]
+        self.back_poses = [
+              [-112.20, 340.393, 143.20, 180, 0.0, 0.0],
+              [-112.20, 380.393, 143.20, 180, 0.0, 0.0],
+              [-72.20, 340.393, 143.20, 180, 0.0, 0.0],
+              [-72.20, 380.390, 143.20, 180, 0.0, 0.0],
+              [-42.20, 340.393, 143.20, 180, 0.0, 0.0],
+          ]
 
         # 末端位置，拾取移动距离 单位mm
         self.end_pose_z = 120.0
@@ -266,9 +272,9 @@ class Connecter(Node):
         状态全程为「运行」。
         """
         # 1. 前往资源点
-        self.publish_panel(progress=f"第{index}个", current="前往资源点", status="运行")
-        offset_x = 0
-        offset_y = -4 if y > 0 else -6
+        self.publish_panel(progress=f"第{index}个", current="前往资源点", status="执行")
+        offset_x = 3
+        offset_y = 0 if y > 0 else -6    #40 -30左边偏右下角
         if not self.move_to_point(
             x * 1000 + offset_x, y * 1000 + offset_y, self.end_pose_z
         ):
@@ -276,21 +282,28 @@ class Connecter(Node):
         sleep(1)
 
         # 2. 抓取资源点（吸取）
-        self.publish_panel(current="抓取资源点", status="运行")
+        self.publish_panel(current="抓取资源", status="执行")
         self.robot.do_pick_on(self.end_move_z)
         sleep(1)
 
-        # 3. 前往放置区（只有一个放置区）
+        # 3. 前往放置区（第 index 个物块 → 第 index 个放置区，超过 5 个循环）
         #    无论成功失败都必须释放吸盘：绝不吸着物块去下一个物块
-        self.publish_panel(current="前往放置区", status="运行")
-        ret = self.robot.go_pose(self.back_pose)
+        self.publish_panel(current="前往放置区", status="执行")
+        back_pose = self.back_poses[(index - 1) % len(self.back_poses)]
+        ret = self.robot.go_pose(back_pose)
         if isinstance(ret, tuple) and ret[0] != 0:
             self.get_logger().error(f"前往放置区失败: {ret}")
+
+        # 不管上面成没成，先把吸盘松开（避免带着物块跑）
         self.robot.pick_off()
         # 释放后抬起来，避免吸盘擦着物块/桌面移动
         self.robot.robot.linear_move([0, 0, 50, 0, 0, 0], INCR, True, 30)
-        return not (isinstance(ret, tuple) and ret[0] != 0)
 
+        # ★ 关键：必须返回布尔值。放置区到达成功才算这个物块抓成功。
+        #   漏了 return 会隐式返回 None，调用方把 None 当「失败」，永远停在第一个。
+        return not (isinstance(ret, tuple) and ret[0] != 0)
+        
+        
 
 def main(args=None):
     rclpy.init(args=args)
