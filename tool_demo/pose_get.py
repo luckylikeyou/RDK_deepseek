@@ -29,10 +29,12 @@ from tools_demo.modules.tools import (
     pixel_to_camera,
     create_handeye_matrix,
     camera_to_tool,
+    Params,
 )
 
 from std_srvs.srv import Trigger
 import json
+import math
 
 import cv2
 
@@ -74,6 +76,7 @@ class DetectionTFBroadcaster(Node):
         self.detected_blocks = []  # 存储检测到的方块信息
         self.detected_blocks_str = ""  # 存储检测到的方块信息的字符串表示
         self.target_count = 0  # 检测的方块数量
+        self.detect_seq = 0  # 检测代次：每次 DNN 出新检测 +1，供调用方判断「新画面」
 
         self.declare_parameter("target_count", self.target_count)
         self.declare_parameter("detected_blocks", "")
@@ -87,6 +90,7 @@ class DetectionTFBroadcaster(Node):
         #     return  # 如果检测已完成，跳过处理
         self.detected_blocks = []  # 清空之前的检测结果
         self.target_count = 0  # 重置目标计数
+        self.detect_seq += 1  # 每收到一次 DNN 检测就 +1
 
         # 等待深度图像
         if self.depth_image is None:
@@ -109,6 +113,12 @@ class DetectionTFBroadcaster(Node):
                 height = roi.rect.height
                 center_x_color = x_offset + width / 2
                 center_y_color = y_offset + height / 2
+
+                # 离画面中心的像素距离（「居中」过滤：越近物块越正、抓得越准）
+                img_w, img_h = Params.color_image_size
+                dist_to_center = math.hypot(
+                    center_x_color - img_w / 2.0, center_y_color - img_h / 2.0
+                )
 
                 # 将彩色坐标转换到深度图像坐标系
                 u_depth, v_depth = center_x_color, center_y_color
@@ -145,6 +155,7 @@ class DetectionTFBroadcaster(Node):
                     "id": len(self.detected_blocks) + len(new_blocks),
                     "tool_pos": [point_3d_tool[0], point_3d_tool[1], point_3d_tool[2]],
                     "color": color,
+                    "dist_to_center": dist_to_center,
                 }
                 # self.get_logger().info(f"block_id: {block_info['id']}")
                 # self.get_logger().info(f"block_color: {block_info['color']}")
@@ -210,6 +221,7 @@ class DetectionTFBroadcaster(Node):
                 "id": block["id"],
                 "tool_pos": block["tool_pos"],
                 "color": block["color"],
+                "dist_to_center": block.get("dist_to_center", 1e9),
             }
             blocks_param.append(block_data)
 
@@ -268,8 +280,13 @@ class DetectionTFBroadcaster(Node):
             ros2 service call /restart_detection std_srvs/srv/Trigger "{}"
         """
         self.get_logger().info("Restarting detection.")
+        blocks_str = self.save_to_parameter_server()
         response.success = True
-        response.message = self.save_to_parameter_server()
+        # 返回 seq（检测代次）+ blocks，调用方据此判断是不是机械臂停稳后的新检测
+        response.message = json.dumps({
+            "seq": self.detect_seq,
+            "blocks": json.loads(blocks_str),
+        })
         return response
 
 
