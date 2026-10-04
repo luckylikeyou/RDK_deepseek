@@ -40,28 +40,62 @@ INCR = 1  # 增量位置
 
 
 class Connecter(Node):
-    # 手眼标定残差校正（由 calib_correct.py 算出）：绕基座Z轴旋转 θ 度 + 平移 (mm)
-    CORRECT_THETA =  2.406   # 度
-    CORRECT_TX =   -2.34  #-5.34      # mm
-    CORRECT_TY =  -6.01        # mm
+    # 手眼标定残差校正：绕基座Z轴旋转 θ 度 + 平移 (mm)
+    # 左右分开（以 y=0 为中线）：y<0 左边用 L 组，y>=0 右边用 R 组。
+    # 原因：单一组刚体(旋转+平移)只能校正「全局刚体」残差，而手眼残差随位置变化、
+    # 左右符号相反，单一一组只能折中。左右各 3 个自由度能各自吸收自己的残差。
+    # 初值都取原来的全局值，标定后分别填入 calib_correct.py 跑左/右两组的输出。
+    CORRECT_THETA_L = 2.406   # 度（左边，y<0）
+    CORRECT_TX_L = 4.34      # mm
+    CORRECT_TY_L = -5.01      # mm
+
+    CORRECT_THETA_R = 2.406   # 度（右边，y>=0）
+    CORRECT_TX_R = -12.34      # mm
+    CORRECT_TY_R = -2.01      # mm
 
     # 扫描位姿（示教得到）：手动把机械臂拖到「相机正对该区域、物块在画面中心」的位置，
     # 用 read_pose.py 读出 [x,y,z,rx,ry,rz](mm,deg) 填到下面。顺序即扫描顺序，中间先放。
     # 第一个建议接近 home（逆解种子最稳），后面的按离前一个由近到远排。
     SCAN_POSES = [
-        #[-252.7, -20.5, 293.7, 180.0, 0.0, 0.0],   # 1 中间(home)
-        [-89.2, -240.8, 285.6, -179.8, -1.8, 65.0],
-        [-217.2, -144.6, 295.0, 179.7, 3.0, 29.0],
-        [-258.7, -34.2, 295.0, 179.7, 3.0, 2.9],
-        [-239.5, 103.6, 294.9, 179.7, 3.0, -28.1],
-        [-258.7, -34.2, 295.0, 179.7, 3.0, 2.9],
-        [-217.2, -144.6, 295.0, 179.7, 3.0, 29.0]
-        # [-250.1, -23.5, 294.7, -180.0, -0.0, 0.0],
-        # [-209.5, 138.6, 294.7, -180.0, -0.0, 0.0]    
+
+        [-26.1, -195.4, 288.5, -179.4, 4.3, 84.0],
+        [-118.4, -157.6, 288.5, -179.4, 4.3, 54.8],
+        [-178.3, -84.0, 288.5, -179.4, 4.3, 26.9],
+        [-197.0, 7.4, 288.5, -179.4, 4.3, -0.5],
+        [-160.2, 114.9, 288.5, -179.4, 4.3, -34.0],
+        [9.3, 253.5, 293.4, -180.0, -0.1, -96.7],
+        [-160.2, 114.9, 288.5, -179.4, 4.3, -34.0],
+        [-197.0, 7.4, 288.5, -179.4, 4.3, -0.5],
+        [-178.3, -84.0, 288.5, -179.4, 4.3, 26.9],
+        [-118.4, -157.6, 288.5, -179.4, 4.3, 54.8]
+        # [17.1, -253.1, 293.3, -180.0, -0.1, 89.2],
+        # [-150.1, -252.8, 293.4, -180.0, -0.1, 80.6],
+        # [-222.7, -121.5, 293.4, -180.0, -0.1, 24.0],
+        # [-252.9, -19.7, 293.4, -180.0, -0.1, -0.2],
+        # [-227.5, 112.2, 293.4, -180.0, -0.1, -30.9],
+        # [-150.5, 204.2, 293.4, -180.0, -0.1, -58.2],
+
+        # [9.3, 253.5, 293.4, -180.0, -0.1, -96.7],
+
+        # [-150.5, 204.2, 293.4, -180.0, -0.1, -58.2],
+        # [-252.9, -19.7, 293.4, -180.0, -0.1, -0.2],
+        # [-252.9, -19.7, 293.4, -180.0, -0.1, -0.2],
+        # [-150.1, -252.8, 293.4, -180.0, -0.1, 80.6]
     ]
 
     # 「居中」过滤半径（像素）：dist_to_center < 此值才抓
     CENTER_RADIUS = 160.0
+
+    # 过滤区（放置区）：物块落在这个矩形内就不抓，避免重复抓取已放置的块。
+    # 单位 mm（基座坐标系）：x ∈ [FILTER_X_MIN, FILTER_X_MAX] 且 y ∈ [FILTER_Y_MIN, FILTER_Y_MAX]
+    FILTER_X_MIN = -200.0
+    FILTER_X_MAX = 0.0
+    FILTER_Y_MIN = 320.0
+    FILTER_Y_MAX = 520.0
+    # 精确过滤：距任一放置点(back_poses)小于该半径(mm)的块视为「已放置」，跳过。
+    # 比矩形过滤更稳：放置点坐标就是机械臂放块的坐标，不受「y_min 只差 5mm」这种
+    # 边界太紧的影响。资源区离放置区远，不会误伤。
+    PLACE_FILTER_RADIUS_MM = 30.0
 
     def __init__(self):
         super().__init__("connecter")
@@ -98,6 +132,7 @@ class Connecter(Node):
         self.target_count = 0
         self.blocks_data = []
         self.targets = []  # 多目标 [{"color":"yellow","num":2}, ...]，按数量降序
+        self.is_busy = False  # 抓取进行中标记：上一轮没结束就再次派单会被单线程执行器吞掉，这里直接拒绝
 
         # 面板动态字段发布（真实抓取时实时刷新 任务进度/当前任务/状态）
         # 面板订阅读的是 TRANSIENT_LOCAL，这里必须一致，否则 QoS 不兼容、面板收不到任何消息
@@ -154,6 +189,12 @@ class Connecter(Node):
         哪个颜色数量多就先抓哪个。
         """
         self.get_logger().info(f"request received: {request.data}")
+        # 上一轮抓取还在跑时直接拒绝，避免请求在单线程执行器里排队、被当成「没反应」
+        if self.is_busy:
+            self.get_logger().warn("上一轮抓取尚未结束（is_busy），拒绝本次派单")
+            response.success = False
+            response.message = "busy: 上一轮抓取尚未结束，请等待完成后再派单"
+            return response
         try:
             cmd = json.loads(request.data)
             targets_data = cmd.get("targets")
@@ -174,15 +215,32 @@ class Connecter(Node):
                 "抓取顺序: " + ", ".join(f"{t['color']}:{t['num']}" for t in self.targets)
             )
 
-            # 启动检测，拿到当前画面方块后开始抓
-            self.restart_detection(done_cb=self.process_restart_result)
-            response.success = True
-            response.message = "Command received, restart_detection in progress"
+            # 启动检测，拿到当前画面方块后开始抓（is_busy 由 _on_detection_done 收尾解除）
+            self.is_busy = True
+            ret = self.restart_detection(done_cb=self._on_detection_done)
+            if ret is False:
+                # 检测服务没起来，任务没法开始，立刻解除占用
+                self.is_busy = False
+                response.success = False
+                response.message = "restart_detection 服务不可用"
+            else:
+                response.success = True
+                response.message = "Command received, restart_detection in progress"
         except Exception as e:
             self.get_logger().error(f"Error processing request: {str(e)}")
+            self.is_busy = False
             response.success = False
             response.message = str(e)
         return response
+
+    def _on_detection_done(self, future):
+        """检测服务回调的收尾包装：无论抓取正常结束还是中途抛异常，都解除 is_busy。"""
+        try:
+            self.process_restart_result(future)
+        except Exception as e:
+            self.get_logger().error(f"抓取流程异常终止: {e}")
+        finally:
+            self.is_busy = False
 
     def process_restart_result(self, future):
         """抓取主流程：颜色外层 × 扇区内层。
@@ -328,13 +386,31 @@ class Connecter(Node):
         return remaining
 
     def blocks_to_base(self, blocks, current_pose):
-        """把一组块（tool 坐标）转成基座坐标，返回 [(base_pos, block), ...]，转换失败跳过。"""
+        """把一组块（tool 坐标）转成基座坐标，返回 [(base_pos, block), ...]。
+        落在过滤区（放置区）的块直接丢弃，不参与抓取；转换失败的也跳过。"""
         out = []
         for b in blocks:
             tool_pos = b.get("tool_pos")
             if not tool_pos or len(tool_pos) < 3:
                 continue
             pos = self.correct_pos(tool_to_base(tool_pos, current_pose))
+            # 过滤放置区：x∈[-200,0] 且 y∈[320,520]（mm）内的块跳过
+            x_mm = pos[0] * 1000.0
+            y_mm = pos[1] * 1000.0
+            color = b.get("color", "?")
+            in_rect = (self.FILTER_X_MIN <= x_mm <= self.FILTER_X_MAX
+                       and self.FILTER_Y_MIN <= y_mm <= self.FILTER_Y_MAX)
+            near_place = self._is_in_placement(x_mm, y_mm)
+            # 诊断：打印每个块的校正后基座坐标 + 过滤判定，核对过滤区边界是否包住放置区
+            if in_rect or near_place:
+                self.get_logger().info(
+                    f"[过滤诊断] color={color} base=({x_mm:.1f}, {y_mm:.1f})mm "
+                    f"矩形内={in_rect} 近放置点={near_place} → 跳过"
+                )
+                continue
+            self.get_logger().info(
+                f"[过滤诊断] color={color} base=({x_mm:.1f}, {y_mm:.1f})mm → 参与抓取"
+            )
             out.append((pos, b))
         return out
 
@@ -354,17 +430,34 @@ class Connecter(Node):
     def correct_pos(self, pos):
         """对计算出的基座坐标施加旋转+平移校正，补偿手眼标定残差。
         pos 单位米，返回校正后的 [x, y, z]（米）。
+        左右分开：按校正前的 y 正负选 L/R 组参数（物块都在 |y|≈250，离 y=0 远，分类稳定）。
         """
         x = pos[0] * 1000.0
         y = pos[1] * 1000.0
-        th = math.radians(self.CORRECT_THETA)
+        if y < 0:
+            th = math.radians(self.CORRECT_THETA_L)
+            tx, ty = self.CORRECT_TX_L, self.CORRECT_TY_L
+        else:
+            th = math.radians(self.CORRECT_THETA_R)
+            tx, ty = self.CORRECT_TX_R, self.CORRECT_TY_R
         xr = x * math.cos(th) - y * math.sin(th)
         yr = x * math.sin(th) + y * math.cos(th)
         return [
-            (xr + self.CORRECT_TX) / 1000.0,
-            (yr + self.CORRECT_TY) / 1000.0,
+            (xr + tx) / 1000.0,
+            (yr + ty) / 1000.0,
             pos[2],
         ]
+
+    def _is_in_placement(self, x_mm, y_mm):
+        """判断校正后的基座坐标 (x,y) 是否落在任一放置点附近（已放置的块）。
+
+        用「到 back_poses 的平面距离」判断，比固定矩形稳：放置点就是机械臂放块的
+        坐标，误差再大也不会差出 30mm；而资源区离放置区远，不会误伤。
+        """
+        for bp in self.back_poses:
+            if math.hypot(x_mm - bp[0], y_mm - bp[1]) < self.PLACE_FILTER_RADIUS_MM:
+                return True
+        return False
 
     def publish_panel(self, progress=None, current=None, status=None):
         """实时刷新面板动态字段（只发传入的非空字段）。"""
@@ -382,7 +475,7 @@ class Connecter(Node):
         """
         # 1. 前往资源点
         self.publish_panel(progress=f"第{index}个", current="前往资源点", status="执行")
-        offset_x = 3
+        offset_x = 0
         offset_y = 0 if y > 0 else -6    #40 -30左边偏右下角
         if not self.move_to_point(
             x * 1000 + offset_x, y * 1000 + offset_y, self.end_pose_z
@@ -392,7 +485,9 @@ class Connecter(Node):
 
         # 2. 抓取资源点（吸取）
         self.publish_panel(current="抓取资源", status="执行")
+        self.get_logger().info(f"第{index}个：开始吸取（下压 {self.end_move_z}mm）")
         self.robot.do_pick_on(self.end_move_z)
+        self.get_logger().info(f"第{index}个：吸取完成，抬起")
         sleep(1)
 
         # 3. 前往放置区（第 index 个物块 → 第 index 个放置区，超过 5 个循环）
@@ -405,7 +500,7 @@ class Connecter(Node):
 
         # 到达放置区后，先向下移动 place_down_z（比抓取多10mm），再放
         self.robot.robot.linear_move(
-            [0, 0, self.place_down_z, 0, 0, 0], INCR, True, 5
+            [0, 0, self.place_down_z, 0, 0, 0], INCR, True, 12
         )
         sleep(0.5)
 

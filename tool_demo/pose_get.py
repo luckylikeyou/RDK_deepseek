@@ -40,6 +40,13 @@ import cv2
 
 
 class DetectionTFBroadcaster(Node):
+    # —— 深度拆分参数（解决「多个并列被合并成一个」和「侧面被误当成两个」）——
+    BLOCK_SIZE_MM = 30.0    # 物块边长 3cm（立方体）
+    TOP_FACE_TOL_M = 0.002  # 顶面深度容差 4mm：侧面是「从顶面深度往下斜的斜坡」，斜拍时
+                            # 侧面只比顶面深 10~15mm，12mm 会把大半侧面误并入顶面、把顶面
+                            # bbox 撑大，导致两个并列块被切成 4 个。收紧到 4mm 只留顶面。
+    MIN_TOP_PIXELS = 10     # 顶面有效像素过少就退回整框中心（旧逻辑）
+
     def __init__(self):
         super().__init__("block_pose_get")
         # 订阅检测结果
@@ -106,62 +113,48 @@ class DetectionTFBroadcaster(Node):
                 if roi.type != "block" or roi.confidence < 0.55:
                     continue
 
-                # 计算中心像素坐标（彩色图像）
                 x_offset = roi.rect.x_offset
                 y_offset = roi.rect.y_offset
                 width = roi.rect.width
                 height = roi.rect.height
-                center_x_color = x_offset + width / 2
-                center_y_color = y_offset + height / 2
 
-                # 离画面中心的像素距离（「居中」过滤：越近物块越正、抓得越准）
                 img_w, img_h = Params.color_image_size
-                dist_to_center = math.hypot(
-                    center_x_color - img_w / 2.0, center_y_color - img_h / 2.0
-                )
 
-                # 将彩色坐标转换到深度图像坐标系
-                u_depth, v_depth = center_x_color, center_y_color
-                # resize_pixel_coordinates(
-                #     center_x_color, center_y_color
-                # )
-                # 校正畸变
-                u_undistorted, v_undistorted = u_depth, v_depth
-                #  correct_distortion(u_depth, v_depth)
-                # 获取深度值
-                depth_value = self.get_depth_value(u_undistorted, v_undistorted)
-                if depth_value is None:
-                    # continue
-                    depth_value = 0.0
-                # 获取颜色
-                color: str = self.get_color_([x_offset, y_offset, width, height])
-                if color == "no_image":
-                    #
-                    color = "no_image"
-                # 转换为3D坐标
-                point_3d = pixel_to_camera(u_undistorted, v_undistorted, depth_value)
+                # 深度拆分：一个 DNN ROI 可能含多个并列块（合并），
+                # 或含「顶面+侧面」（物块位置偏、相机斜拍）。这里按「顶面深度 + 物块
+                # 尺寸」拆成 1..N 个真实物块中心（纯深度、不分颜色），逐个采样颜色
+                # 再转 3D 入库。
+                for (u, v, depth_value, color) in self.split_block_centers(
+                    x_offset, y_offset, width, height
+                ):
+                    # 颜色已在 split_block_centers 里按该子块「顶面掩膜」多数投票得出，
+                    # 不再在中心点取固定小窗（固定小窗在异色并列时会采到相邻块、两个都同色）
 
-                # 将相机坐标系下的3D点转换为工具坐标系下的3D点
-                point_3d_tool = camera_to_tool(
-                    point_3d[0], point_3d[1], point_3d[2], self.T_tool_cam
-                )
+                    # 离画面中心的像素距离（「居中」过滤：越近物块越正、抓得越准）
+                    dist_to_center = math.hypot(u - img_w / 2.0, v - img_h / 2.0)
 
-                # 检查是否已检测到类似位置的方块（避免重复）
-                if not self.is_new_block(point_3d_tool):
-                    continue
+                    # 转换为3D坐标
+                    point_3d = pixel_to_camera(u, v, depth_value)
 
-                # 创建方块信息
-                block_info = {
-                    "id": len(self.detected_blocks) + len(new_blocks),
-                    "tool_pos": [point_3d_tool[0], point_3d_tool[1], point_3d_tool[2]],
-                    "color": color,
-                    "dist_to_center": dist_to_center,
-                }
-                # self.get_logger().info(f"block_id: {block_info['id']}")
-                # self.get_logger().info(f"block_color: {block_info['color']}")
+                    # 将相机坐标系下的3D点转换为工具坐标系下的3D点
+                    point_3d_tool = camera_to_tool(
+                        point_3d[0], point_3d[1], point_3d[2], self.T_tool_cam
+                    )
 
-                new_blocks.append(block_info)
-                self.target_count += 1  # 增加目标计数
+                    # 检查是否已检测到类似位置的方块（避免重复）
+                    if not self.is_new_block(point_3d_tool):
+                        continue
+
+                    # 创建方块信息
+                    block_info = {
+                        "id": len(self.detected_blocks) + len(new_blocks),
+                        "tool_pos": [point_3d_tool[0], point_3d_tool[1], point_3d_tool[2]],
+                        "color": color,
+                        "dist_to_center": dist_to_center,
+                    }
+
+                    new_blocks.append(block_info)
+                    self.target_count += 1  # 增加目标计数
 
         # 添加新检测到的方块
         self.detected_blocks.extend(new_blocks)
@@ -251,8 +244,13 @@ class DetectionTFBroadcaster(Node):
         )
         return self.detected_blocks_str
 
-    def is_new_block(self, position, min_distance=0.03):
-        """检查是否是新方块（避免重复检测）"""
+    def is_new_block(self, position, min_distance=0.02):
+        """检查是否是新方块（避免重复检测）。
+
+        min_distance 从 0.03 降到 0.02：两个并列同色块的间距 ≈ 3cm，用 0.03 判重
+        时测量噪声会误把相邻块当成重复、丢掉一个；0.02 仍能去掉「同一块被重复检出」
+        （间隔 <2cm），又不会吃掉间距 3cm 的相邻块。
+        """
         for block in self.detected_blocks:
             existing_pos = block["tool_pos"]
             distance = np.sqrt(
@@ -273,6 +271,143 @@ class DetectionTFBroadcaster(Node):
         if 0 <= x < width and 0 <= y < height:
             return self.depth_image[int(y), int(x)] / 1000.0  # 毫米转米
         return None
+
+    def sample_block_color(self, u, v, r=6):
+        """在子块中心 (u, v) 附近取一小块，判断该块颜色（异色并列时各判各的）。
+
+        返回 "blue" / "yellow" / "other"。r 取小块半径（像素），中心一定落在
+        该子块顶面内部，不会采到相邻块。
+        """
+        if self.color_image_ is None:
+            return "other"
+        img_h, img_w = self.color_image_.shape[:2]
+        x0, y0 = max(0, int(u) - r), max(0, int(v) - r)
+        x1, y1 = min(img_w, int(u) + r), min(img_h, int(v) + r)
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            return "other"
+        return get_color(self.color_image_, [x0, y0, x1 - x0, y1 - y0])
+
+    def color_from_mask(self, mask, ox, oy):
+        """对顶面掩膜 mask 内的彩色像素做多数投票，返回 blue/yellow/other。
+
+        异色并列时，固定小窗(如 13×13)若采到相邻块就会两个都判成同色；这里改成
+        用「该子块自己的顶面掩膜外接框」去采色，外接框只落在自己块上，天然不会
+        混进相邻块的颜色。mask 是 (h,w) bool，ox,oy 是它在彩色图里的左上角像素坐标。
+        """
+        if self.color_image_ is None:
+            return "other"
+        ys, xs = np.nonzero(mask)
+        if len(xs) < self.MIN_TOP_PIXELS:
+            return "other"
+        x0, x1 = int(xs.min()) + ox, int(xs.max()) + ox + 1
+        y0, y1 = int(ys.min()) + oy, int(ys.max()) + oy + 1
+        img_h, img_w = self.color_image_.shape[:2]
+        x0, y0 = max(0, x0), max(0, y0)
+        x1, y1 = min(img_w, x1), min(img_h, y1)
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            return "other"
+        color = get_color(self.color_image_, [x0, y0, x1 - x0, y1 - y0])
+        # 诊断：打印采色框和蓝/黄占比，判断是「采错位置」还是「HSV 判错」
+        try:
+            sub = self.color_image_[y0:y1, x0:x1]
+            hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+            mb = cv2.countNonZero(cv2.inRange(hsv, Params.lower_blue, Params.upper_blue))
+            my = cv2.countNonZero(cv2.inRange(hsv, Params.lower_yellow, Params.upper_yellow))
+            tot = sub.shape[0] * sub.shape[1]
+            self.get_logger().info(
+                f"[颜色诊断] bbox=({x0},{y0},{x1 - x0},{y1 - y0}) 判定={color} "
+                f"blue={mb / tot:.2f} yellow={my / tot:.2f}"
+            )
+        except Exception as e:
+            self.get_logger().error(f"颜色诊断失败: {e}")
+        return color
+
+    def split_block_centers(self, x, y, w, h):
+        """把一个 DNN ROI 按「顶面深度 + 物块尺寸」拆成 1..N 个物块中心。
+
+        纯深度拆分、不按颜色预过滤，所以同色/异色并列都能拆开；颜色由调用方对
+        每个子块单独采样。解决两类问题：
+          1. 多个物块并列 → DNN 把多个合并成一个 ROI，这里按 3cm 边长把顶面
+             切成 N 份，返回 N 个中心；
+          2. 物块位置偏、相机拍到侧面 → 顶面+侧面同色但深度不同（侧面比顶面
+             深约 3cm），这里只保留「顶面」（最近的深度平面），避免把侧面误
+             当成第二个物块。
+
+        参数:
+            x, y, w, h: ROI 在彩色/深度图中的像素框
+        返回:
+            [(u, v, depth, color), ...]  每个子块一个中心（颜色图像素坐标 + 深度米 + 颜色）
+        """
+        if self.depth_image is None:
+            # 深度没就绪，退回整框中心（和旧逻辑一致）
+            d = self.get_depth_value(x + w / 2, y + h / 2) or 0.0
+            return [(x + w / 2, y + h / 2, d, self.sample_block_color(x + w / 2, y + h / 2))]
+
+        img_h, img_w = self.depth_image.shape[:2]
+        x0, y0 = max(0, int(x)), max(0, int(y))
+        x1, y1 = min(img_w, int(x + w)), min(img_h, int(y + h))
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return [(x + w / 2, y + h / 2, 0.0, self.sample_block_color(x + w / 2, y + h / 2))]
+
+        # 1) 深度子图（mm → 米）。顶面是最靠前的平面，比桌面/侧面都近，
+        #    单靠深度就能和背景、侧面分开，不需要颜色掩膜。
+        roi_depth = self.depth_image[y0:y1, x0:x1].astype(np.float32) / 1000.0
+        valid = roi_depth > 0.05
+        if int(valid.sum()) < self.MIN_TOP_PIXELS:
+            return [(x + w / 2, y + h / 2, 0.0, self.sample_block_color(x + w / 2, y + h / 2))]
+
+        # 2) 顶面深度 = 最近 5% 分位（相机朝下，顶面最靠前=深度最小）
+        depths = roi_depth[valid]
+        d_top = float(np.percentile(depths, 5))
+        top_mask = valid & (roi_depth <= d_top + self.TOP_FACE_TOL_M)
+
+        ys, xs = np.nonzero(top_mask)
+        if len(xs) < self.MIN_TOP_PIXELS:
+            return [(x + w / 2, y + h / 2, 0.0, self.sample_block_color(x + w / 2, y + h / 2))]
+
+        # 3) 顶面在 d_top 深度处的物理尺寸：1 像素 ≈ d_top / fx 米
+        pixel_mm = d_top * 1000.0 / Params.camera_matrix[0, 0]
+        u_min, u_max = int(xs.min()), int(xs.max())
+        v_min, v_max = int(ys.min()), int(ys.max())
+        n_w = max(1, int(round((u_max - u_min + 1) * pixel_mm / self.BLOCK_SIZE_MM)))
+        n_h = max(1, int(round((v_max - v_min + 1) * pixel_mm / self.BLOCK_SIZE_MM)))
+        # 诊断：打印顶面 bbox 的物理尺寸和切分结果，用来核对「侧面撑大bbox→切成4个」这类问题
+        self.get_logger().info(
+            f"[拆分诊断] ROI=({x:.0f},{y:.0f},{w:.0f},{h:.0f}) d_top={d_top*1000:.0f}mm "
+            f"顶面bbox={(u_max-u_min+1)*pixel_mm:.0f}x{(v_max-v_min+1)*pixel_mm:.0f}mm "
+            f"→ 切成 {n_w}x{n_h}"
+        )
+
+        # 4) 单个物块：顶面质心（比整框中心准，天然避开了侧面）
+        if n_w * n_h <= 1:
+            d = float(np.median(roi_depth[top_mask]))
+            color = self.color_from_mask(top_mask, x0, y0)
+            return [(float(x0 + xs.mean()), float(y0 + ys.mean()), d, color)]
+
+        # 5) 多个物块：按 n_w×n_h 网格切分顶面，每格取该格顶面像素的质心
+        u_step = (u_max - u_min + 1) / n_w
+        v_step = (v_max - v_min + 1) / n_h
+        centers = []
+        for i in range(n_w):
+            u_lo = int(u_min + u_step * i)
+            u_hi = int(u_min + u_step * (i + 1))
+            for j in range(n_h):
+                v_lo = int(v_min + v_step * j)
+                v_hi = int(v_min + v_step * (j + 1))
+                seg = top_mask[v_lo:v_hi + 1, u_lo:u_hi + 1]
+                if int(seg.sum()) < self.MIN_TOP_PIXELS:
+                    continue
+                sy, sx = np.nonzero(seg)
+                seg_depth = roi_depth[v_lo:v_hi + 1, u_lo:u_hi + 1][seg]
+                color = self.color_from_mask(seg, x0 + u_lo, y0 + v_lo)
+                centers.append((float(x0 + u_lo + sx.mean()),
+                                float(y0 + v_lo + sy.mean()),
+                                float(np.median(seg_depth)),
+                                color))
+
+        if not centers:
+            return [(x + w / 2, y + h / 2, 0.0, self.sample_block_color(x + w / 2, y + h / 2))]
+        return centers
 
     def restart_detection_callback(self, request, response: Trigger.Response):
         """处理重启检测的请求"""
