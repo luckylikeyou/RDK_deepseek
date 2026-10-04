@@ -106,10 +106,11 @@ def build_panel_state(counts):
         '先抓取': CN.get(first, first),
         '后抓取': CN.get(second, second),
         '任务进度': '第1个',
-        # 动态字段（任务进度/当前任务/状态）在真实抓取时由 connecter 接管：
-        #   状态 = 运行；当前任务 = 前往资源点 / 抓取资源点 / 前往放置区；放完回 待命
+        # 动态字段（任务进度/当前任务/状态）：结果一上屏即进入「执行」，
+        #   随后由 connecter 接管（前往资源点 / 抓取资源点 / 前往放置区），放完回 待命。
+        #   面板状态词只有 待命/执行 两个，没有「已完成」。
         '当前任务': '',
-        '状态': '待命',
+        '状态': '执行',
     }
     return {
         'labels': labels,
@@ -219,17 +220,17 @@ def publish_state(node, state, pubs=None):
     return labels
 
 
-def publish_idle_dynamic(pubs):
-    """把动态字段（任务进度/当前任务/状态）复位回「待命」。
+def publish_running_dynamic(pubs):
+    """新答案到来时把动态字段（任务进度/当前任务/状态）置为「执行中」初始态。
 
-    真实抓取时这三个字段由 connecter 节点接管（运行 / 前往资源点 / 抓取资源点 /
-    前往放置区），这里只在新答案到来时把面板复位一次，避免残留上一轮抓取的状态。
-    复位后不再重发动态字段，防止把 connecter 的实时进度覆盖掉。
+    结果一上屏即表示任务已下发、机械臂即将开始抓取，所以状态写「执行」而非「待命」。
+    真实抓取时这三个字段由 connecter 节点接管（前往资源点 / 抓取资源点 / 前往放置区），
+    这里只在新答案到来时置一次初始态，之后不再重发，防止把 connecter 的实时进度覆盖掉。
     """
     from std_msgs.msg import String
     pubs['progress'].publish(String(data="第1个"))
     pubs['current'].publish(String(data=""))
-    pubs['status'].publish(String(data="待命"))
+    pubs['status'].publish(String(data="执行"))
 
 
 def dispatch_to_arm(node, rclpy, counts):
@@ -356,7 +357,7 @@ def _watch(rclpy, path, question_path=None):
                     else:
                         last_state = build_panel_state(counts)
                         labels = publish_state(node, last_state, pubs)
-                        publish_idle_dynamic(pubs)
+                        publish_running_dynamic(pubs)
                         print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
                         dispatch_to_arm(node, rclpy, counts)
                         # 结果追加到题目后面，一起发到「题目」面板
@@ -413,7 +414,7 @@ def main():
     state = build_panel_state(counts)
     pubs = make_publishers(node)
     labels = publish_state(node, state, pubs)
-    publish_idle_dynamic(pubs)
+    publish_running_dynamic(pubs)
     print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
 
     if args.simulate:
