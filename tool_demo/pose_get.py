@@ -41,8 +41,8 @@ import cv2
 
 class DetectionTFBroadcaster(Node):
     # —— 深度拆分参数（解决「多个并列被合并成一个」和「侧面被误当成两个」）——
-    BLOCK_SIZE_MM = 30.0    # 物块边长 3cm（立方体）
-    TOP_FACE_TOL_M = 0.002  # 顶面深度容差 4mm：侧面是「从顶面深度往下斜的斜坡」，斜拍时
+    BLOCK_SIZE_MM = 31.0    # 物块边长 3cm（立方体）
+    TOP_FACE_TOL_M = 0.000  # 顶面深度容差 4mm：侧面是「从顶面深度往下斜的斜坡」，斜拍时
                             # 侧面只比顶面深 10~15mm，12mm 会把大半侧面误并入顶面、把顶面
                             # bbox 撑大，导致两个并列块被切成 4 个。收紧到 4mm 只留顶面。
     MIN_TOP_PIXELS = 10     # 顶面有效像素过少就退回整框中心（旧逻辑）
