@@ -8,6 +8,10 @@
     中心近的物块（dist_to_center < CENTER_RADIUS），保证每个都正对、抓得准。
   - 顺序：先抓完数量多的颜色（外层），再抓少的；每个颜色内部逐扇区找（内层）。
   - 兜底 B：某颜色所有扇区扫完仍不够，再逐扇区抓离中心最近的边缘块。
+  - 每抓一个物块 → 回到扫描位姿重扫一次再抓下一个（不一次抓空一个扇区，
+    避免旧检测算出的过期坐标抓偏）。
+  - 抓取在后台线程跑：一轮结束后回待命、解除占用，点「开始任务」可再派单，
+    不用重启服务。
 
 面板动态字段（真实抓取时实时刷新）：
   状态 = 执行；当前任务 = 前往资源点 / 抓取资源 / 前往放置区；放完回 待命。
@@ -15,6 +19,7 @@
 
 import json
 import math
+import threading
 
 import rclpy
 from rclpy.node import Node
@@ -46,38 +51,38 @@ class Connecter(Node):
     # 左右符号相反，单一一组只能折中。左右各 3 个自由度能各自吸收自己的残差。
     # 初值都取原来的全局值，标定后分别填入 calib_correct.py 跑左/右两组的输出。
     CORRECT_THETA_L = 2.406   # 度（左边，y<0）
-    CORRECT_TX_L = 4.34      # mm
-    CORRECT_TY_L = -6.01      # mm
+    CORRECT_TX_L = 3.34 #4.34      # mm
+    CORRECT_TY_L = -5.01      # mm
 
     CORRECT_THETA_R = 2.406   # 度（右边，y>=0）
-        CORRECT_TX_R = -12.34      # mm
-        CORRECT_TY_R = -2.01      # mm
+    CORRECT_TX_R = -10.34      # mm
+    CORRECT_TY_R = -2.01      # mm
 
     # 扫描位姿（示教得到）：手动把机械臂拖到「相机正对该区域、物块在画面中心」的位置，
     # 用 read_pose.py 读出 [x,y,z,rx,ry,rz](mm,deg) 填到下面。顺序即扫描顺序，中间先放。
     # 第一个建议接近 home（逆解种子最稳），后面的按离前一个由近到远排。
     SCAN_POSES = [
 
-        [-26.1, -195.4, 288.5, -179.4, 4.3, 84.0],
-        [-118.4, -157.6, 288.5, -179.4, 4.3, 54.8],
-        [-178.3, -84.0, 288.5, -179.4, 4.3, 26.9],
-        [-197.0, 7.4, 288.5, -179.4, 4.3, -0.5],
+        [-10.3, -230.9, 254.7, -177.6, 2.7, 84.7],
+        [-138.1, -185.4, 254.6, -177.6, 2.7, 50.6],
+        [-212.4, -81.3, 254.7, -177.6, 2.7, 20.5],
+        [-218.1, 36.6, 254.7, -177.6, 2.7, -22.1],
+        [-218.1, 130.6, 254.7, -177.6, 2.7, -22.1],
+        [-146.8, 178.6, 254.7, -177.6, 2.7, -53.3],
+        [-23.8, 204.0, 219.1, 179.4, -0.9, -88.2],
+
         
-        [-160.2, 114.9, 288.5, -179.4, 4.3, -34.0],
-        [9.3, 253.5, 293.4, -180.0, -0.1, -96.7],
-        [-160.2, 114.9, 288.5, -179.4, 4.3, -34.0],
-        [-197.0, 7.4, 288.5, -179.4, 4.3, -0.5],
-        [-178.3, -84.0, 288.5, -179.4, 4.3, 26.9],
-        [-118.4, -157.6, 288.5, -179.4, 4.3, 54.8]
+        [-218.1, 150.6, 254.7, -177.6, 2.7, -22.1],
+        [-212.4, -91.3, 254.7, -177.6, 2.7, 20.5]
         
     ]
 
     # 「居中」过滤半径（像素）：dist_to_center < 此值才抓
-    CENTER_RADIUS = 160.0
+    CENTER_RADIUS = 200  #160.0
 
     # 过滤区（放置区）：物块落在这个矩形内就不抓，避免重复抓取已放置的块。
     # 单位 mm（基座坐标系）：x ∈ [FILTER_X_MIN, FILTER_X_MAX] 且 y ∈ [FILTER_Y_MIN, FILTER_Y_MAX]
-    FILTER_X_MIN = -200.0
+    FILTER_X_MIN = -150.0
     FILTER_X_MAX = 0.0
     FILTER_Y_MIN = 320.0
     FILTER_Y_MAX = 520.0
@@ -152,25 +157,29 @@ class Connecter(Node):
         self.get_logger().info("Connecter service started")
         return ret
 
-    def restart_detection(self, done_cb=None):
+    def restart_detection(self, timeout_sec=10.0):
+        """调用 /restart_detection 服务并等结果返回 response；失败/超时返回 None。
+
+        供后台抓取线程调用：不能再 spin_once（会跟主 executor 打架、把本轮卡死成
+        「只能抓一次」），而是轮询 future.done() 阻塞等待，靠主 executor 完成 future。
+        （本版 rclpy 的 Future.result() 不带 timeout 参数，所以手动轮询做超时。）
+        """
         if not self.srv_client.wait_for_service(timeout_sec=10.0):
-            self.get_logger().info("service not available, waiting again...")
-            return False
-
-        self.get_logger().info("service available")
-
+            self.get_logger().warn("restart_detection 服务不可用")
+            return None
         request = Trigger.Request()
         future = self.srv_client.call_async(request)
-
-        if done_cb:
-            future.add_done_callback(done_cb)
-            return future
-        else:
-            # 非阻塞轮询
-            while not future.done():
-                rclpy.spin_once(self, timeout_sec=0.1)
-            self.get_logger().info("Service call completed")
+        deadline = time() + timeout_sec
+        while not future.done():
+            if time() >= deadline:
+                self.get_logger().error("restart_detection 调用超时")
+                return None
+            sleep(0.05)
+        try:
             return future.result()
+        except Exception as e:
+            self.get_logger().error(f"restart_detection 调用失败: {e}")
+            return None
 
     def connect_callback_(self, request: StrMsg.Request, response: StrMsg.Response):
         """接收多目标抓取请求：
@@ -203,42 +212,49 @@ class Connecter(Node):
             self.get_logger().info(
                 "抓取顺序: " + ", ".join(f"{t['color']}:{t['num']}" for t in self.targets)
             )
-
-            # 启动检测，拿到当前画面方块后开始抓（is_busy 由 _on_detection_done 收尾解除）
-            self.is_busy = True
-            ret = self.restart_detection(done_cb=self._on_detection_done)
-            if ret is False:
-                # 检测服务没起来，任务没法开始，立刻解除占用
-                self.is_busy = False
-                response.success = False
-                response.message = "restart_detection 服务不可用"
-            else:
-                response.success = True
-                response.message = "Command received, restart_detection in progress"
         except Exception as e:
             self.get_logger().error(f"Error processing request: {str(e)}")
-            self.is_busy = False
             response.success = False
             response.message = str(e)
+            return response
+
+        # 后台线程跑抓取，不阻塞 executor（否则本轮结束后收不到下一轮派单、只能重启服务）
+        self.is_busy = True
+        self.publish_panel(status="执行")  # 派单即切「执行」，进度/当前仍「—」直到第一个块开抓
+        threading.Thread(target=self._grab_task, daemon=True).start()
+        response.success = True
+        response.message = "Command received, grab in progress"
         return response
 
-    def _on_detection_done(self, future):
-        """检测服务回调的收尾包装：无论抓取正常结束还是中途抛异常，都解除 is_busy。"""
+    def _grab_task(self):
+        """后台抓取线程入口：跑完整轮抓取，结束后无论成败都解除占用、回待命。
+
+        抓取跑在独立线程，主 executor 只负责处理服务请求/响应，不再被长流程阻塞，
+        所以本轮结束后能立刻接收下一轮派单（不用重启服务）。
+        """
         try:
-            self.process_restart_result(future)
+            self.process_restart_result()
         except Exception as e:
             self.get_logger().error(f"抓取流程异常终止: {e}")
         finally:
             self.is_busy = False
+            try:
+                self.robot.pick_end()
+                self.robot.go_home()
+            except Exception as e:
+                self.get_logger().error(f"收尾回 home 失败: {e}")
+            # 三格一起复位：状态=待命、进度=—、当前=—（「—」不匹配任何规则，面板显示 fallback「—」）
+            self.publish_panel(progress="—", current="—", status="待命")
+            self.get_logger().info("本轮任务结束，回到待命，可再次派单")
 
-    def process_restart_result(self, future):
-        """抓取主流程：颜色外层 × 扇区内层。
+    def process_restart_result(self):
+        """抓取主流程：颜色外层 × 扇区内层，每抓一个物块就回到扫描位姿重扫。
 
-        第一次重启检测（home 视角）的结果这里不用，下面每个扇区都会重新检测。
-        每个颜色：先逐扇区抓「居中」块（dist_to_center < CENTER_RADIUS）；
-        全扫完仍不够，走兜底 B：再逐扇区抓离中心最近的边缘块（不限 R）。
+        关键改动：不再一次性把「一个扇区里所有该颜色块」抓完——那样第 2 个起用的
+        是旧检测算出的过期坐标（抓完第一个机械臂已去了放置区，位姿变了会算错/抓偏）。
+        改成每次只抓最居中那一个，抓完回扫描位姿重扫，保证每个块都用最新画面算坐标。
         """
-        self.get_logger().info("开始扇区扫描抓取")
+        self.get_logger().info("开始抓取（每抓一个回扫一次）")
         self.robot.pick_init()
         self.grab_index = 0  # 全局物块序号（决定放置区，超过 5 个循环）
 
@@ -246,22 +262,19 @@ class Connecter(Node):
             color = t["color"]
             remaining = t["num"]
 
-            # ---- 第一遍：逐扇区抓居中块 ----
+            # ---- 第一遍：逐扇区抓居中块，抓一个重扫一次 ----
             for scan_pose in self.scan_poses:
-                if remaining <= 0:
-                    break
-                if not self.move_to_scan(scan_pose):
-                    continue
-                blocks = self.detect_blocks_sync()
-                if not blocks:
-                    continue
-                cand = [
-                    b for b in blocks
-                    if b.get("color") == color
-                    and b.get("dist_to_center", 1e9) < self.CENTER_RADIUS
-                ]
-                cand.sort(key=lambda b: b.get("dist_to_center", 1e9))
-                remaining = self.grab_from_sector(cand, color, remaining)
+                while remaining > 0:
+                    if not self.move_to_scan(scan_pose):
+                        break
+                    grabbable = self.current_grabbable(color, centered_only=True)
+                    if not grabbable:
+                        break  # 本扇区没有该颜色居中块了，换下一扇区
+                    pos, b = grabbable[0]  # 最居中
+                    if self.grab_one(pos, b, color):
+                        remaining -= 1
+                    else:
+                        break  # 抓失败，换下一扇区
 
             # ---- 兜底 B：还差就逐扇区抓离中心最近的块（不限 R） ----
             if remaining > 0:
@@ -269,24 +282,20 @@ class Connecter(Node):
                     f"{color} 居中块抓完还差 {remaining} 个，走兜底抓边缘块"
                 )
                 for scan_pose in self.scan_poses:
-                    if remaining <= 0:
-                        break
-                    if not self.move_to_scan(scan_pose):
-                        continue
-                    blocks = self.detect_blocks_sync()
-                    if not blocks:
-                        continue
-                    cand = [b for b in blocks if b.get("color") == color]
-                    cand.sort(key=lambda b: b.get("dist_to_center", 1e9))
-                    remaining = self.grab_from_sector(cand, color, remaining)
+                    while remaining > 0:
+                        if not self.move_to_scan(scan_pose):
+                            break
+                        grabbable = self.current_grabbable(color, centered_only=False)
+                        if not grabbable:
+                            break
+                        pos, b = grabbable[0]
+                        if self.grab_one(pos, b, color):
+                            remaining -= 1
+                        else:
+                            break
 
             if remaining > 0:
                 self.get_logger().warn(f"{color} 最终还差 {remaining} 个没抓到")
-
-        self.robot.pick_end()
-        self.robot.go_home()
-        # 全部完成，回待命
-        self.publish_panel(status="待命", current="")
 
     def move_to_scan(self, scan_pose):
         """移动到示教好的扫描位姿（go_pose，6 自由度）。到位后等机械臂停稳。"""
@@ -340,39 +349,44 @@ class Connecter(Node):
         self.get_logger().warn("等待新鲜检测超时")
         return last_blocks
 
-    def grab_from_sector(self, cand, color, remaining):
-        """在当前扫描位姿下，抓取候选块（tool 坐标 → 基座坐标）里靠前的块。
+    def current_grabbable(self, color, centered_only):
+        """当前扫描位姿下，返回该颜色可抓块列表 [(base_pos, block), ...]。
 
-        关键：所有块的 tool→base 转换都用「扫描位姿」下的工具位姿，只取一次——
-        不能抓一个取一次，因为抓完第一个机械臂已经去了放置区，位姿变了会算错。
+        - 只取该颜色块（可选：只取「居中」块 dist_to_center < CENTER_RADIUS）；
+        - 统一转基座坐标并过滤放置区（blocks_to_base 内做）；
+        - 按离画面中心由近到远排序，调用方抓第一个。
+        每次只抓一个后回扫，所以这里只用「当前这一刻」的位姿算一次，坐标不会过期。
         """
+        blocks = self.detect_blocks_sync()
+        if not blocks:
+            return []
         current_pose = self.robot.get_tools_pos()
         if current_pose == -1:
-            self.get_logger().error("获取工具位姿失败，跳过本扇区")
-            return remaining
-        base_list = self.blocks_to_base(cand, current_pose)
+            self.get_logger().error("获取工具位姿失败")
+            return []
+        cand = [b for b in blocks if b.get("color") == color]
+        if centered_only:
+            cand = [b for b in cand if b.get("dist_to_center", 1e9) < self.CENTER_RADIUS]
+        base_list = self.blocks_to_base(cand, current_pose)  # 已过滤放置区
+        base_list.sort(key=lambda pb: pb[1].get("dist_to_center", 1e9))
+        return base_list
 
-        for pos, b in base_list:
-            if remaining <= 0:
-                break
-            self.grab_index += 1
-            self.get_logger().info(
-                f"抓取第{self.grab_index}个：{color}（dist={b.get('dist_to_center')}）"
+    def grab_one(self, pos, b, color):
+        """抓取单个块（基座坐标已算好），返回是否成功。"""
+        self.grab_index += 1
+        self.get_logger().info(
+            f"抓取第{self.grab_index}个：{color}（dist={b.get('dist_to_center')}）"
+        )
+        try:
+            ok = self.pick(pos[0], pos[1], pos[2], self.grab_index)
+        except Exception as e:
+            self.get_logger().error(
+                f"抓取第{self.grab_index}个({color})异常：{e}"
             )
-            try:
-                ok = self.pick(pos[0], pos[1], pos[2], self.grab_index)
-            except Exception as e:
-                self.get_logger().error(
-                    f"抓取第{self.grab_index}个({color})异常：{e}"
-                )
-                ok = False
-            if ok:
-                remaining -= 1
-            else:
-                self.get_logger().error(
-                    f"抓取第{self.grab_index}个({color})失败，跳过"
-                )
-        return remaining
+            ok = False
+        if not ok:
+            self.get_logger().error(f"抓取第{self.grab_index}个({color})失败")
+        return ok
 
     def blocks_to_base(self, blocks, current_pose):
         """把一组块（tool 坐标）转成基座坐标，返回 [(base_pos, block), ...]。
