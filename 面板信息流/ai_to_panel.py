@@ -20,15 +20,21 @@
   /task/plan                              std_msgs/String(JSON)       -> 完整抓取顺序
   /task/blocks                            visualization_msgs/MarkerArray -> 3D 面板按数量渲染方块
 
+订阅主题（供开始按钮）：
+  /task/start                             std_msgs/String             -> "basic"/"challenge"（按下即选任务并出题）
+
 用法：
   python3 ai_to_panel.py "{color:yellow,num:4},{color:blue,num:1}"
   python3 ai_to_panel.py "{color:yellow,num:4},{color:blue,num:1}" --simulate   # 2s/步演示进度
   python3 ai_to_panel.py --watch /tmp/ai_answer.txt   # 监听文件（deepseek 写完即解析）
+  python3 ai_to_panel.py --watch /tmp/ai_answer.txt --question /tmp/question.txt   # 按钮出题 + 题目上屏
 """
 import argparse
 import json
 import os
+import subprocess
 import sys
+import threading
 import time
 
 from parse_ai_answer import parse_ai_answer
@@ -78,6 +84,44 @@ def build_result_text(counts):
     if not parts:
         return ""
     return "结果：" + "、".join(parts)
+
+
+def apply_task_rule(mode, counts):
+    """按任务类型把「解题结果」换算成「最终抓取数量」。
+
+    challenge：解出几个抓几个（counts 原样）。
+    basic：固定抓 3 个——数量多的颜色抓 2、少的抓 1；相等按黄2蓝1。
+    某颜色原本没出现(None)则保持不抓，避免去抓不存在的颜色。
+    """
+    if mode != "basic":
+        return dict(counts)
+    y = counts.get("yellow") or 0
+    b = counts.get("blue") or 0
+    out = {"yellow": 2, "blue": 1} if y >= b else {"yellow": 1, "blue": 2}
+    if counts.get("yellow") is None:
+        out["yellow"] = None
+    if counts.get("blue") is None:
+        out["blue"] = None
+    return out
+
+
+QUESTION_GEN_CMD_DEFAULT = "./TMSCQtest_arm.bin > /tmp/question.txt"
+
+
+def run_generator():
+    """运行题目生成器，把题目写进 /tmp/question.txt，返回是否成功。
+
+    命令用环境变量 QUESTION_GEN_CMD 覆盖（默认 ./TMSCQtest_arm.bin > /tmp/question.txt）。
+    生成器阻塞（最长 ~15s），调用方务必放到子线程，别卡住 ROS executor。
+    """
+    cmd = os.environ.get("QUESTION_GEN_CMD", QUESTION_GEN_CMD_DEFAULT)
+    try:
+        subprocess.check_call(cmd, shell=True, timeout=20)
+        return True
+    except Exception as e:
+        print(f"[出题] 运行生成器失败：{e}", file=sys.stderr)
+        return False
+
 
 def build_panel_state(counts):
     """纯函数：{yellow, blue} -> 面板状态。
@@ -310,6 +354,11 @@ def _watch(rclpy, path, question_path=None):
 
     question_path：题目文件（如 /tmp/question.txt），变化即把题目发到 /task/problem；
     答案变化时把「结果」追加到题目后面一起发。
+
+    新增「开始按钮」：订阅 /task/start（std_msgs/String，值为 basic/challenge），
+    按下即 (1) 选任务类型 (2) 后台跑题目生成器（默认 ./TMSCQtest_arm.bin > /tmp/question.txt，
+    可用 QUESTION_GEN_CMD 覆盖）。生成器出题后由 deepseek_client 解题写回答案文件，
+    本节点再把「解题结果」按任务类型换算后派单抓取。
     """
     from rclpy.node import Node
     from std_msgs.msg import String
@@ -322,8 +371,31 @@ def _watch(rclpy, path, question_path=None):
     problem_message = ""       # 发到 /task/problem 的完整内容（题目 + 结果）
     last_q_mtime = None
 
+    # 当前任务类型：默认挑战任务（和加按钮前「解几个抓几个」行为一致）
+    mode = "challenge"
+
     node = Node('ai_to_panel')
     pubs = make_publishers(node)
+
+    # ---- 开始按钮：Publish 面板点一下发一条 String("basic"/"challenge") 到 /task/start ----
+    def on_start(msg):
+        nonlocal mode
+        task = (msg.data or "").strip().lower()
+        if task not in ("basic", "challenge"):
+            print(f"⚠️ 未知任务类型 {msg.data!r}（应为 basic 或 challenge），忽略", file=sys.stderr)
+            return
+        mode = task
+        print(f"→ 收到开始按钮：{task}，启动出题程序…")
+        threading.Thread(target=_run_generator, args=(task,), daemon=True).start()
+
+    def _run_generator(task):
+        if run_generator():
+            print(f"[{task}] 题目已生成，等待 DeepSeek 解题…")
+        else:
+            print(f"[{task}] 出题失败，任务未开始", file=sys.stderr)
+
+    node.create_subscription(String, "/task/start", on_start, 10)
+
     if question_path:
         print(f"监听题目 {question_path} ...")
     print(f"监听答案 {path} ...（每 0.5s 重发兜底，Ctrl+C 停止）")
@@ -343,7 +415,7 @@ def _watch(rclpy, path, question_path=None):
                         pubs['problem'].publish(String(data=problem_message))
                         print(f"已发布题目到 {PROBLEM_TOPIC}：{problem_text}")
 
-            # ---- 答案文件：mtime 变了就解析 + 派单 ----
+            # ---- 答案文件：mtime 变了就解析 + 按任务类型换算 + 派单 ----
             if os.path.exists(path):
                 mtime = os.path.getmtime(path)
                 if mtime != last_mtime:
@@ -355,13 +427,26 @@ def _watch(rclpy, path, question_path=None):
                     if counts['yellow'] is None and counts['blue'] is None:
                         print(f"⚠️ 未解析到答案：{content[:80]!r}", file=sys.stderr)
                     else:
-                        last_state = build_panel_state(counts)
+                        final = apply_task_rule(mode, counts)
+                        if final != counts:
+                            print(f"[{mode}] 解题 黄={counts.get('yellow')} 蓝={counts.get('blue')}"
+                                  f" → 抓取 黄={final.get('yellow')} 蓝={final.get('blue')}")
+                        last_state = build_panel_state(final)
                         labels = publish_state(node, last_state, pubs)
                         publish_running_dynamic(pubs)
                         print("已发布：", ", ".join(f"{k}={v}" for k, v in labels.items()))
-                        dispatch_to_arm(node, rclpy, counts)
+                        # 先让面板把「映射结果」（黄/蓝数量、先抓/后抓、3D 方块）收到并渲染出来，
+                        # 再派单让机械臂动。否则发布和派单几乎同时，面板还没上屏机械臂就动了。
+                        try:
+                            map_delay = float(os.environ.get("PANEL_MAP_DELAY", "2.0"))
+                        except ValueError:
+                            map_delay = 2.0
+                        if map_delay > 0:
+                            rclpy.spin_once(node, timeout_sec=0.5)  # 泵一次把发布刷出去
+                            time.sleep(map_delay)                    # 等 coStudio 渲染映射
+                        dispatch_to_arm(node, rclpy, final)
                         # 结果追加到题目后面，一起发到「题目」面板
-                        result = build_result_text(counts)
+                        result = build_result_text(final)
                         if result and problem_text:
                             problem_message = f"{problem_text}\n{result}"
                             pubs['problem'].publish(String(data=problem_message))
@@ -374,7 +459,9 @@ def _watch(rclpy, path, question_path=None):
                 if problem_message:
                     pubs['problem'].publish(String(data=problem_message))
                 last_pub = time.time()
-            time.sleep(0.05)
+
+            # 泵一次 executor：既当循环节拍，又处理 /task/start 按钮回调
+            rclpy.spin_once(node, timeout_sec=0.05)
     except KeyboardInterrupt:
         pass
 

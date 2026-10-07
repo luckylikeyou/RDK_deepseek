@@ -439,6 +439,10 @@ class DetectionTFBroadcaster(Node):
                 sy, sx = np.nonzero(seg)
                 seg_depth = roi_depth[v_lo:v_hi + 1, u_lo:u_hi + 1][seg]
                 c = self.color_from_mask(seg, x0 + u_lo, y0 + v_lo)
+                # 侧面/阴影等判不出蓝黄的格子是「幻影块」（不是要抓的物块），直接丢弃，
+                # 避免把物块侧面当成一个独立物块画绿框、还污染 target_count
+                if c == "other":
+                    continue
                 box = (x0 + u_lo + int(sx.min()), y0 + v_lo + int(sy.min()),
                        int(sx.max() - sx.min()) + 1, int(sy.max() - sy.min()) + 1)
                 centers.append((float(x0 + u_lo + sx.mean()),
